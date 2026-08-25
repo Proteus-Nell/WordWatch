@@ -1,25 +1,47 @@
 # WordWatch Setup
 
-To run this bot on a Discord server: <br />
-1. Visit `https://discordapp.com/developers/applications/me` and set up a bot account. <br />
-2. Copy the Client/Application ID. <br />
-3. Go to `https://discordapp.com/oauth2/authorize?client_id=CLIENT_ID_GOES_HERE&scope=bot&permissions=0`. <br />
-4. Authorize bot access to your desired server. <br />
-5. Make sure you've done `pip install discord.py` in command prompt if you don't have it already. <br />
-6. Obtain bot token from the developer page. <br />
-7. Copy .env.example to .env and replace the placeholder with a valid bot token. <br />
+To run this bot on a Discord server:
 
-The bot can now be run! <br />
-# About
+### 1. Set Up Your Application on the Discord Developer Portal
+1. Visit the [Discord Developer Portal](https://discord.com/developers/applications).
+2. Click **New Application** in the top right corner, name your bot, and save.
+3. Select the **Bot** tab on the left menu, then click **Add Bot** (if not already a bot).
+4. Scroll down on the **Bot** tab to the **Privileged Gateway Intents** section.
+5. **CRITICAL**: Enable the **Message Content Intent** (and optionally *Presence Intent* and *Server Members Intent*), then click **Save Changes**.
 
-WordWatch is a Discord chat bot that can track key words and phrases. For example, if a user wants to track the phrase `lorem ipsum` and be alerted every time that phrase is used in a conversation, all they would need to do is run a simple command.
-Users can easily customize notification frequency and choose which channels of a server they want the bot to scan messages for.
+### 2. Generate the Bot Invite Link
+1. Go to the **OAuth2** tab on the left menu, then select the **URL Generator** sub-menu.
+2. Under **Scopes**, you MUST select both:
+   *   `bot` (to add the bot to the server)
+   *   `applications.commands` (to register Slash Commands in Discord's chat autocomplete box)
+3. Under **Bot Permissions**, select:
+   *   `Send Messages`
+   *   `Embed Links`
+   *   `Read Messages/View Channels`
+   *   `Read Message History`
+4. Copy the generated URL at the bottom, paste it into your web browser, and authorize the bot to join your server.
 
-The inspiration for this bot stems from a conversation on the UCI Discord Server. A user asked if it was possible to track certain phrases (such as UCI courses) and be notified whenever the term appears in conversations.
-I ended up creating this chat bot in about 16 hours over the course of 4 days.
+### 3. Run the Bot Locally
+1. Obtain the bot's token from the **Bot** tab by clicking the **Reset Token** button.
+2. Copy `.env.example` in the project root to a new file named `.env`:
+   ```bash
+   copy .env.example .env
+   ```
+3. Open `.env` and replace `your_discord_bot_token_here` with your copied Discord bot token.
+4. Ensure you have the dependencies installed:
+   ```bash
+   pip install discord.py
+   ```
+5. Run the bot:
+   ```bash
+   python main.py
+   ```
+
+### 4. Register Slash Commands
+Once the bot is online, type the prefix command `..sync` in any text channel on your server (you must be a server administrator to do this). This will instantly register all commands as slash commands in that server. (Otherwise, global registration can take up to 1 hour to propagate).
 
 # Commands
-The bot uses the prefix `..` to invoke commands.
+The bot uses the prefix `..` to invoke commands or you can use the slash command and preview your available options.
 
 Calling a command in the chat (example demonstrates the `help` command): `..help`
 
