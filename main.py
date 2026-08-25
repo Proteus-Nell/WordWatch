@@ -11,13 +11,12 @@ import io
 
 import help_str
 
-prefix = ".."
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 intents.members = True
 
-bot = commands.Bot(command_prefix=prefix, description='WordWatch Bot', intents=intents)
+bot = commands.Bot(command_prefix=commands.when_mentioned, description='WordWatch Bot', intents=intents)
 bot.remove_command('help')  # removes default help command!
 
 # Swear word tracking constants & regex
@@ -50,7 +49,6 @@ SWEAR_WORDS = load_swear_words()
 SWEAR_PATTERN = re.compile(r'\b(' + '|'.join(map(re.escape, SWEAR_WORDS)) + r')\b', re.IGNORECASE)
 
 # Const attributes
-bot.prefix = prefix
 bot.user_words_file = "userwords.json"
 bot.user_cds_file = "usercds.json"
 bot.swear_counts_file = "swearcounts.json"
@@ -94,20 +92,7 @@ async def on_ready():
     else:
         bot.leaderboards = {}
 
-    await bot.change_presence(activity=discord.Game(name="Questions? Type {prefix}help".format(prefix=bot.prefix)))
-
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def sync(ctx):
-    """Syncs slash commands to the current server (guild) instantly for testing."""
-    await ctx.send("Syncing commands to this guild...")
-    try:
-        # Syncing to guild copies commands specifically to this guild (instant propagation)
-        bot.tree.copy_global_to(guild=ctx.guild)
-        synced = await bot.tree.sync(guild=ctx.guild)
-        await ctx.send(f"Successfully synced {len(synced)} commands to this guild!")
-    except Exception as e:
-        await ctx.send(f"Failed to sync commands: {e}")
+    await bot.change_presence(activity=discord.Game(name="Questions? Type /help"))
 
 @bot.hybrid_command()
 async def help(ctx):
@@ -120,34 +105,34 @@ async def help(ctx):
     await ctx.author.send(embed=embed)
 
     embed = discord.Embed(title="WordWatch Bot Commands",
-                          description=help_str.description_str.format(prefix=bot.prefix),
+                          description=help_str.description_str,
                           color=0xa3a3a3)
     embed.add_field(name="watched",
                     value=help_str.watched_str,
                     inline=False)
     embed.add_field(name="watchword \"word\" [channels (optional)]",
-                    value=help_str.watchword_str.format(prefix=bot.prefix),
+                    value=help_str.watchword_str,
                     inline=False)
     embed.add_field(name="deleteword \"word\"",
-                    value=help_str.deleteword_str.format(prefix=bot.prefix),
+                    value=help_str.deleteword_str,
                     inline=False)
     embed.add_field(name="watchclear",
                     value=help_str.watchclear_str,
                     inline=False)
     embed.add_field(name="cd [minutes]",
-                    value=help_str.cd_str.format(prefix=bot.prefix),
+                    value=help_str.cd_str,
                     inline=False)
     embed.add_field(name="worddetail \"word\"",
-                    value=help_str.worddetail_str.format(prefix=bot.prefix),
+                    value=help_str.worddetail_str,
                     inline=False)
     embed.add_field(name="addfilter \"word\" [channels]",
-                    value=help_str.addfilter_str.format(prefix=bot.prefix),
+                    value=help_str.addfilter_str,
                     inline=False)
     embed.add_field(name="deletefilter \"word\" [channels]",
-                    value=help_str.deletefilter_str.format(prefix=bot.prefix),
+                    value=help_str.deletefilter_str,
                     inline=False)
     embed.add_field(name="clearfilter \"word\"",
-                    value=help_str.clearfilter_str.format(prefix=bot.prefix),
+                    value=help_str.clearfilter_str,
                     inline=False)
     embed.add_field(name="swearboard",
                     value="Outputs a live-updating table of the top swearers in the server.",
@@ -155,6 +140,8 @@ async def help(ctx):
     embed.set_footer(text=help_str.footer_str)
 
     await ctx.author.send(embed=embed)
+
+    await ctx.send(embed=discord.Embed(title="📬 Check your DMs for the documentation!", color=0x30abc0))
 
 def get_channel_id(channel_mention: str) -> int:
     """Extracts numeric channel ID from a discord channel mention string."""
@@ -671,7 +658,7 @@ async def on_message(message):
         author_id_str = str(message.author.id)
 
         # 1. Swear word detection & counting
-        if message.content[:2] != bot.prefix:
+        if not message.author.bot:
             matches = SWEAR_PATTERN.findall(message.content)
             if matches:
                 if guild_id_str not in bot.swear_counts:
@@ -710,7 +697,7 @@ async def on_message(message):
                         print(f"Error updating leaderboard: {e}")
 
         # 2. Key words scanning & alerts
-        if message.content[:2] != bot.prefix:
+        if not message.author.bot:
             for mem in list(bot.user_words.keys()):
                 if guild_id_str in bot.user_words[mem]:
                     for keyword, innerdict in list(bot.user_words[mem][guild_id_str].items()):
@@ -743,7 +730,7 @@ async def on_message(message):
                                 except Exception as e:
                                     print(f"Error alerting user {mem}: {e}")
 
-    await bot.process_commands(message)
+
 
 async def save_json():
     """Saves user data in JSON format periodically."""
@@ -787,17 +774,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: discord.
     else:
         await interaction.response.send_message(msg, ephemeral=True)
 
-@bot.event
-async def on_command_error(ctx, error):
-    """Handles errors for prefix commands."""
-    if isinstance(error, commands.NoPrivateMessage):
-        embed = discord.Embed(title="You can't use this command outside of servers.", color=0xe23a1d)
-        await ctx.send(embed=embed)
-    elif isinstance(error, commands.MissingPermissions):
-        embed = discord.Embed(title="Command only usable by admin", color=0xe23a1d)
-        await ctx.send(embed=embed)
-    else:
-        raise error
+
 
 async def custom_setup():
     bot.loop.create_task(save_json())

@@ -36,7 +36,7 @@ To run this bot on a Discord server:
 4. Ensure you have the dependencies installed:
 
    ```bash
-   pip install discord.py
+   pip install -r requirements.txt
    ```
 
 5. Run the bot:
@@ -45,62 +45,66 @@ To run this bot on a Discord server:
    python main.py
    ```
 
-### 4. Register Slash Commands
-
-Once the bot is online, type the prefix command `..sync` in any text channel on your server (you must be a server administrator to do this). This will instantly register all commands as slash commands in that server. (Otherwise, global registration can take up to 1 hour to propagate).
+Slash commands are synced globally on startup. It may take up to 1 hour for them to appear in a new server.
 
 # Commands
 
-The bot uses the prefix `..` to invoke commands or you can use the slash command and preview your available options.
-
-Calling a command in the chat (example demonstrates the `help` command): `..help`
+All commands are invoked via Discord's **Slash Commands** — type `/` in any text channel to see available options.
 
 Note: Phrases must be wrapped in quotes but single words don't. Also, commands will not work outside servers the bot is running in.
 
-1. `help` - Displays documentation in chat on how to use the bot.
+1. `/help` - Displays documentation in a DM on how to use the bot.
 
-2. `watched` - Gives user list of all watched words/phrases on the server. Also shows current `cd` setting.
+2. `/watched` - Gives user list of all watched words/phrases on the server. Also shows current `cd` setting.
 
-3. `watchword "word" [channels (optional)]` - Start watching a word and be alerted according to your `cd` setting. Channels can be filtered, skipping the `addfilter` step. Simply list channels after the word/phrase separated by spaces.
+3. `/watchword "word" [channels (optional)]` - Start watching a word and be alerted according to your `cd` setting. Channels can be filtered, skipping the `addfilter` step. Simply list channels after the word/phrase separated by spaces.
 
-         ..watchword "lorem ipsum" #general
-         ..watchword lorem #general #off-topic
-         ..watchword "lorem ipsum"
-         ..watchword lorem
+         /watchword "lorem ipsum" #general
+         /watchword lorem #general #off-topic
+         /watchword "lorem ipsum"
+         /watchword lorem
 
-4. `deleteword "word"` - Deletes the specified word/phrase from your watch list.
+4. `/deleteword "word"` - Deletes the specified word/phrase from your watch list.
 
-         ..deleteword "lorem ipsum"
-         ..deleteword lorem
+         /deleteword "lorem ipsum"
+         /deleteword lorem
 
-5. `watchclear` - Clears all watched words/phrases that you are watching.
+5. `/watchclear` - Clears all watched words/phrases that you are watching.
 
-6. `cd [minutes]` - Toggle how long before you want to be alerted again after the most recent alert. Set at 15 minutes by default.
+6. `/cd [minutes]` - Toggle how long before you want to be alerted again after the most recent alert. Set at 15 minutes by default.
 
-         ..cd
-         ..cd 3
+         /cd
+         /cd 3
 
-7. `worddetail "word"` - Tells you the filtered channels enabled for the word/phrase and time the word/phrase was last seen.
+7. `/worddetail "word"` - Tells you the filtered channels enabled for the word/phrase and time the word/phrase was last seen.
 
-         ..worddetail "lorem ipsum"
-         ..worddetail lorem
+         /worddetail "lorem ipsum"
+         /worddetail lorem
 
-8. `addfilter "word" [channels]` - Start watching for word/phrase in specified channels. Will not replace previously watching channels.
+8. `/addfilter "word" [channels]` - Start watching for word/phrase in specified channels. Will not replace previously watching channels.
 
-         ..addfilter lorem #general #games
+         /addfilter lorem #general #games
 
-9. `deletefilter "word" [channels]` - Stop watching for word/phrase in specified channels.
+9. `/deletefilter "word" [channels]` - Stop watching for word/phrase in specified channels.
 
-         ..deletefilter "lorem ipsum" #off-topic #general
+         /deletefilter "lorem ipsum" #off-topic #general
 
-10. `clearfilter "word"` - Remove all filters from word/phrase; watch entire server instead.
+10. `/clearfilter "word"` - Remove all filters from word/phrase; watch entire server instead.
 
-         ..clearfilter "lorem ipsum"
-         ..clearfilter lorem
+         /clearfilter "lorem ipsum"
+         /clearfilter lorem
 
-11. `forcesave` - Force saves all current data into the JSON files. Admin only!
+11. `/swearboard` - Outputs a live-updating table of the top swearers in the server.
 
-12. `botstop` - Saves data and logs out bot. Admin only!
+12. `/swearreset` - Resets the swear leaderboard. Admin only!
+
+13. `/swearexport` - Exports the swear leaderboard as a JSON file. Admin only!
+
+14. `/swearimport` - Imports swear leaderboard data from an attached JSON file. Admin only!
+
+15. `/forcesave` - Force saves all current data into the JSON files. Admin only!
+
+16. `/botstop` - Saves data and logs out bot. Admin only!
 
 ## AI Usage Disclaimer
 
