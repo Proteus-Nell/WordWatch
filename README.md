@@ -7,7 +7,7 @@ To run this bot on a Discord server: <br />
 4. Authorize bot access to your desired server. <br />
 5. Make sure you've done `pip install discord.py` in command prompt if you don't have it already. <br />
 6. Obtain bot token from the developer page. <br />
-7. On bot_token.py replace the bot-token placeholder with a valid token. <br />
+7. Copy .env.example to .env and replace the placeholder with a valid bot token. <br />
 
 The bot can now be run! <br />
 # About

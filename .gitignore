@@ -1,0 +1,10 @@
+# Secrets
+.env
+
+# Local state files / databases
+*.json
+!help_str.py
+
+# Python caching
+__pycache__/
+*.pyc
