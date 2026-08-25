@@ -4,786 +4,1731 @@ import calendar
 import time
 import datetime
 import asyncio
+import hashlib
 import json
 import os
 import re
 import io
+import traceback
 
 import help_str
 
+
+# ---------------------------------------------------------------------------
+# Environment loading
+# ---------------------------------------------------------------------------
+def load_env(filepath: str = ".env") -> None:
+    """Loads KEY=VALUE pairs from a dotenv file into os.environ.
+
+    The real process environment always wins: a key is only taken from the file
+    when it is not already present in os.environ. This makes `DISCORD_TOKEN=xxx
+    python main.py`, systemd/Docker `Environment=` entries and CI secrets behave
+    the way operators expect, instead of being silently clobbered by a stale
+    committed-next-to-the-code .env file.
+
+    Tolerated syntax: blank lines, `#` comment lines, an optional `export `
+    prefix, and values wrapped in a matching pair of single or double quotes.
+    """
+    if not os.path.isfile(filepath):
+        return
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export ") or line.startswith("export\t"):
+                    line = line[len("export"):].lstrip()
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip()
+                if not key or key in os.environ:
+                    # Already set for real: the process environment wins.
+                    continue
+                val = val.strip()
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                    val = val[1:-1]
+                os.environ[key] = val
+    except OSError as e:
+        print("WARNING: could not read {} ({}); using the process environment only.".format(filepath, e))
+
+
+load_env()
+
+
+# ---------------------------------------------------------------------------
+# Typed environment readers
+#
+# Every one of these falls back to the documented default and prints a warning
+# when the value is unusable. Configuration mistakes must never stop the bot
+# from booting.
+# ---------------------------------------------------------------------------
+def _env_str(name: str, default: str) -> str:
+    """Reads a string setting; blank/whitespace-only values fall back to the default."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if not raw:
+        print("WARNING: {} is set but empty; using default {!r}.".format(name, default))
+        return default
+    return raw
+
+
+def _env_int(name: str, default: int, minimum: int | None = None, maximum: int | None = None) -> int:
+    """Reads an integer setting, clamped to [minimum, maximum] when given."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        print("WARNING: {}={!r} is not a whole number; using default {}.".format(name, raw, default))
+        return default
+    if minimum is not None and value < minimum:
+        print("WARNING: {}={} is below the minimum of {}; using {}.".format(name, value, minimum, minimum))
+        return minimum
+    if maximum is not None and value > maximum:
+        print("WARNING: {}={} is above the maximum of {}; using {}.".format(name, value, maximum, maximum))
+        return maximum
+    return value
+
+
+def _env_float(name: str, default: float, minimum: float | None = None, maximum: float | None = None) -> float:
+    """Reads a floating-point setting, clamped to [minimum, maximum] when given."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        print("WARNING: {}={!r} is not a number; using default {}.".format(name, raw, default))
+        return default
+    if value != value:  # NaN compares false against everything, including itself
+        print("WARNING: {}={!r} is not a number; using default {}.".format(name, raw, default))
+        return default
+    if minimum is not None and value < minimum:
+        print("WARNING: {}={} is below the minimum of {}; using {}.".format(name, value, minimum, minimum))
+        return minimum
+    if maximum is not None and value > maximum:
+        print("WARNING: {}={} is above the maximum of {}; using {}.".format(name, value, maximum, maximum))
+        return maximum
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+#
+# Everything tunable lives here and can be overridden from the environment or
+# from .env (see .env.example). The literal in each call is the default that
+# ships with the bot.
+# ---------------------------------------------------------------------------
+
+# Required. Bot token from the Discord Developer Portal.
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "").strip()
+if not DISCORD_TOKEN:
+    raise SystemExit("ERROR: DISCORD_TOKEN not set. Copy .env.example to .env and add your token.")
+
+# Data files. Relative paths resolve against the process working directory.
+USER_WORDS_FILE = _env_str("WORDWATCH_USER_WORDS_FILE", "userwords.json")
+USER_CDS_FILE = _env_str("WORDWATCH_USER_CDS_FILE", "usercds.json")
+SWEAR_COUNTS_FILE = _env_str("WORDWATCH_SWEAR_COUNTS_FILE", "swearcounts.json")
+LEADERBOARDS_FILE = _env_str("WORDWATCH_LEADERBOARDS_FILE", "leaderboards.json")
+
+# Newline-separated list of tracked swear words.
+SWEAR_WORDS_FILE = _env_str("WORDWATCH_SWEAR_WORDS_FILE", "swear_words.txt")
+
+# Cached fingerprint of the slash-command set, used to skip redundant syncs.
+SYNC_STATE_FILE = _env_str("WORDWATCH_SYNC_STATE_FILE", ".command_sync.json")
+
+# Thumbnail shown on /help and on watched-word alerts.
+ALERT_THUMBNAIL_URL = _env_str(
+    "WORDWATCH_ALERT_THUMBNAIL_URL",
+    "https://raw.githubusercontent.com/pixeltopic/WordWatch/master/alertimage.gif")
+
+# Seconds between periodic autosaves of all bot data.
+SAVE_FREQUENCY = _env_int("WORDWATCH_SAVE_FREQUENCY", 900, minimum=1)
+
+# Seconds between debounced swear-count saves. 0 saves on every swear.
+SWEAR_SAVE_FREQUENCY = _env_int("WORDWATCH_SWEAR_SAVE_FREQUENCY", 30, minimum=0)
+
+# Minimum seconds between edits of a server's live swearboard message.
+# Discord rate-limits message edits, so this keeps a busy server from
+# burning its budget (and getting the bot 429'd) on leaderboard updates.
+LEADERBOARD_UPDATE_FREQUENCY = _env_int("WORDWATCH_LEADERBOARD_UPDATE_FREQUENCY", 30, minimum=0)
+
+# Default per-user alert cooldown, in minutes, for users who never ran /cd.
+DEFAULT_COOLDOWN_MINUTES = _env_float("WORDWATCH_DEFAULT_COOLDOWN_MINUTES", 15.0, minimum=0.0)
+DEFAULT_COOLDOWN_SECONDS = int(DEFAULT_COOLDOWN_MINUTES * 60)
+
+# Shortest word /watchword will accept. Very short words match constantly.
+MIN_WATCHWORD_LENGTH = _env_int("WORDWATCH_MIN_WATCHWORD_LENGTH", 3, minimum=1)
+
+# Truncation limit for the "Content" field of an alert embed. Discord rejects
+# embed field values longer than 1024 characters, so that is the hard ceiling.
+ALERT_CONTENT_MAX_CHARS = _env_int("WORDWATCH_ALERT_CONTENT_MAX_CHARS", 1000, minimum=1, maximum=1024)
+
+# Words listed per page by /watched.
+WATCHED_PAGE_SIZE = _env_int("WORDWATCH_WATCHED_PAGE_SIZE", 50, minimum=1)
+
+# Largest accepted /swearimport attachment, in bytes.
+MAX_IMPORT_BYTES = _env_int("WORDWATCH_MAX_IMPORT_BYTES", 1_000_000, minimum=1)
+
+# Set to 1 to force a global command sync regardless of the cached fingerprint.
+FORCE_SYNC = _env_str("WORDWATCH_FORCE_SYNC", "0").lower() in ("1", "true", "yes", "on")
+
+
+
+
+# ---------------------------------------------------------------------------
+# Bot
+# ---------------------------------------------------------------------------
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 intents.members = True
 
-bot = commands.Bot(command_prefix=commands.when_mentioned, description='WordWatch Bot', intents=intents)
+
+class WordWatchBot(commands.Bot):
+    """commands.Bot subclass so setup_hook is a real override, not a monkey-patch.
+
+    discord.Client awaits setup_hook() exactly once, inside login(), after the loop
+    and HTTP session exist but before the first CONNECT. That makes it the correct
+    home for one-time startup work. on_ready is NOT such a place - it re-fires on
+    every RESUME/reconnect.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._data_loaded = False
+        # Strong reference: loop.create_task only keeps a weak one, so without
+        # this the periodic save task can be garbage collected mid-flight.
+        self._save_task = None
+
+    async def setup_hook(self) -> None:
+        load_data()
+        if self._save_task is None or self._save_task.done():
+            self._save_task = self.loop.create_task(save_json(), name="wordwatch-periodic-save")
+        await sync_commands_if_changed()
+
+
+bot = WordWatchBot(command_prefix=commands.when_mentioned,
+                   description='WordWatch Bot', intents=intents)
 bot.remove_command('help')  # removes default help command!
 
-# Swear word tracking constants & regex
-def load_env(filepath=".env"):
-    if not os.path.exists(filepath):
-        return
-    with open(filepath, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" not in line:
-                continue
-            key, val = line.split("=", 1)
-            os.environ[key.strip()] = val.strip().strip('"').strip("'")
+# ---------------------------------------------------------------------------
+# Swear word list
+# ---------------------------------------------------------------------------
+DEFAULT_SWEAR_WORDS = {"ass", "bitch", "crap", "damn", "fuck", "hell", "shit"}
 
-load_env()
-token = os.getenv("DISCORD_TOKEN")
-if not token:
-    raise SystemExit("ERROR: DISCORD_TOKEN not set. Copy .env.example to .env and add your token.")
 
-def load_swear_words(filepath="swear_words.txt"):
-    if not os.path.exists(filepath):
-        return {"ass", "bitch", "crap", "damn", "fuck", "hell", "shit"}
-    with open(filepath, "r", encoding="utf-8") as f:
-        return {line.strip() for line in f if line.strip()}
+def load_swear_words(filepath: str = SWEAR_WORDS_FILE) -> set:
+    """Reads the tracked swear words, falling back to a small built-in list."""
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            words = {line.strip().lower() for line in f if line.strip()}
+    except FileNotFoundError:
+        print("WARNING: {} not found; falling back to the built-in swear list.".format(filepath))
+        return set(DEFAULT_SWEAR_WORDS)
+    except (OSError, UnicodeDecodeError) as e:
+        print("WARNING: could not read {} ({}); falling back to the built-in list.".format(filepath, e))
+        return set(DEFAULT_SWEAR_WORDS)
+    if not words:
+        print("WARNING: {} is empty; falling back to the built-in swear list.".format(filepath))
+        return set(DEFAULT_SWEAR_WORDS)
+    return words
+
 
 SWEAR_WORDS = load_swear_words()
 
-SWEAR_PATTERN = re.compile(r'\b(' + '|'.join(map(re.escape, SWEAR_WORDS)) + r')\b', re.IGNORECASE)
+# Sentinel used as the value in channel dicts to mimic a set. Not configurable.
+bot.static = -1
 
-# Const attributes
-bot.user_words_file = "userwords.json"
-bot.user_cds_file = "usercds.json"
-bot.swear_counts_file = "swearcounts.json"
-bot.leaderboards_file = "leaderboards.json"
-bot.thumb = "https://raw.githubusercontent.com/pixeltopic/WordWatch/master/alertimage.gif"
-bot.static = -1  # used for channel dict values to mimic a set
-bot.save_frequency = 900  # number of seconds before bot saves user data
-bot.swear_save_frequency = 30  # seconds between swear-triggered batch saves
-
-# Non-Constants
+# ---------------------------------------------------------------------------
+# Mutable runtime state
+# ---------------------------------------------------------------------------
 bot.user_words = dict()
 bot.user_cds = dict()
 bot.swear_counts = dict()
 bot.leaderboards = dict()
-bot.swear_dirty = False  # tracks unsaved swear data
-bot.last_swear_save = 0  # timestamp of last swear-triggered save
+bot.swear_dirty = False               # True when swear_counts holds unsaved changes
+bot.last_swear_save = 0               # epoch seconds of the last successful save
+bot.last_leaderboard_update = dict()  # guild_id -> epoch seconds of last board edit
+bot.leaderboard_pending = set()       # guild_ids whose board needs a redraw
+bot.leaderboard_tasks = dict()        # guild_id -> scheduled flush task
+bot.leaderboard_locks = dict()        # guild_id -> asyncio.Lock
+bot.leaderboard_messages = dict()     # guild_id -> cached Message handle
 
-@bot.event
-async def on_ready():
-    print("Logged in as")
-    print(bot.user.name)
-    print("Warning: bot requires both {} and {} to load data.".format(bot.user_words_file, bot.user_cds_file))
-    if os.path.isfile("./" + bot.user_words_file) and os.path.isfile("./" + bot.user_cds_file):
-        with open(bot.user_words_file) as word_data:
-            bot.user_words = json.load(word_data)
-        with open(bot.user_cds_file) as cd_data:
-            bot.user_cds = json.load(cd_data)
-        print("Data loaded successfully.")
-    else:
-        print("No data files provided or one was missing. No user data loaded.")
+# Constants consumed by command callbacks, exposed on the bot for convenience.
+bot.thumb = ALERT_THUMBNAIL_URL
+bot.default_cooldown_minutes = DEFAULT_COOLDOWN_MINUTES
+bot.default_cooldown_seconds = DEFAULT_COOLDOWN_SECONDS
+bot.min_watchword_length = MIN_WATCHWORD_LENGTH
+bot.alert_content_max_chars = ALERT_CONTENT_MAX_CHARS
+bot.watched_page_size = WATCHED_PAGE_SIZE
+bot.max_import_bytes = MAX_IMPORT_BYTES
+bot.leaderboard_update_frequency = LEADERBOARD_UPDATE_FREQUENCY
+bot.save_frequency = SAVE_FREQUENCY
+bot.swear_save_frequency = SWEAR_SAVE_FREQUENCY
 
-    if os.path.isfile("./" + bot.swear_counts_file):
-        with open(bot.swear_counts_file) as f:
-            bot.swear_counts = json.load(f)
-    else:
-        bot.swear_counts = {}
 
-    if os.path.isfile("./" + bot.leaderboards_file):
-        with open(bot.leaderboards_file) as f:
-            bot.leaderboards = json.load(f)
-    else:
-        bot.leaderboards = {}
+# ---------------------------------------------------------------------------
+# Swear word detection
+#
+# Two properties matter here and neither was true before:
+#
+#   Determinism. SWEAR_WORDS is a set, so '|'.join(...) produced a different
+#   alternation order in every process (string hashing is seed-randomised).
+#   Python's re alternation is first-alternative-wins, not longest-match, so a
+#   message scored differently after a restart: "ass-fucker" counted 1 on some
+#   boots and 2 on others. Sorting by descending length (then alphabetically to
+#   break ties) makes the order stable AND makes the longest entry win.
+#
+#   Speed. The pattern has ~2745 alternatives and re has no trie optimisation,
+#   so every word boundary retried all of them: ~17ms for a page of ordinary
+#   prose, on the event loop, for every message. A cheap token prefilter skips
+#   the regex entirely for the overwhelming majority of messages, which contain
+#   no swear at all.
+#
+# Counting rule: non-overlapping, left-to-right, longest-match-first, case
+# insensitive, each match bounded by \b exactly as before. "class" still does
+# not count as "ass".
+# ---------------------------------------------------------------------------
 
-    await bot.change_presence(activity=discord.Game(name="Questions? Type /help"))
+_WORD_RUN = re.compile(r'\w+', re.UNICODE)
 
-@bot.hybrid_command()
-async def help(ctx):
-    """Messages the user bot documentation"""
-    embed = discord.Embed(title="WordWatch Bot",
-                          description="Checks messages for key words and notifies you!",
-                          color=0x30abc0)
-    embed.set_thumbnail(url=bot.thumb)
-    embed.set_footer(text="by pixeltopic")
-    await ctx.author.send(embed=embed)
 
-    embed = discord.Embed(title="WordWatch Bot Commands",
-                          description=help_str.description_str,
-                          color=0xa3a3a3)
-    embed.add_field(name="watched",
-                    value=help_str.watched_str,
-                    inline=False)
-    embed.add_field(name="watchword \"word\" [channels (optional)]",
-                    value=help_str.watchword_str,
-                    inline=False)
-    embed.add_field(name="deleteword \"word\"",
-                    value=help_str.deleteword_str,
-                    inline=False)
-    embed.add_field(name="watchclear",
-                    value=help_str.watchclear_str,
-                    inline=False)
-    embed.add_field(name="cd [minutes]",
-                    value=help_str.cd_str,
-                    inline=False)
-    embed.add_field(name="worddetail \"word\"",
-                    value=help_str.worddetail_str,
-                    inline=False)
-    embed.add_field(name="addfilter \"word\" [channels]",
-                    value=help_str.addfilter_str,
-                    inline=False)
-    embed.add_field(name="deletefilter \"word\" [channels]",
-                    value=help_str.deletefilter_str,
-                    inline=False)
-    embed.add_field(name="clearfilter \"word\"",
-                    value=help_str.clearfilter_str,
-                    inline=False)
-    embed.add_field(name="swearboard",
-                    value="Outputs a live-updating table of the top swearers in the server.",
-                    inline=False)
-    embed.set_footer(text=help_str.footer_str)
+def _prefilter_key(entry: str):
+    """The most selective \\w+ run of an entry, or None if it has none.
 
-    await ctx.author.send(embed=embed)
+    Soundness: when a \\b-anchored entry matches, every one of its \\w+ runs is a
+    complete token of the message. The first run is preceded by a non-word
+    character (or the string start) because of the leading \\b; every later run is
+    preceded by the non-word character that separates it inside the entry; and
+    each run is followed either by a non-word character inside the entry or, for
+    the final run, by the non-word character the trailing \\b requires. So keying
+    on ANY run is sound -- and the longest one is the most selective, which keeps
+    common words like "a" (from the entry "a s s") out of the prefilter.
 
-    await ctx.send(embed=discord.Embed(title="📬 Check your DMs for the documentation!", color=0x30abc0))
+    Entries with no word characters at all (e.g. "@$$") get no key and are always
+    tested, since "b@$$y" is a legitimate match.
+    """
+    runs = _WORD_RUN.findall(entry)
+    if not runs:
+        return None
+    return max(runs, key=lambda r: (len(r), r)).lower()
+
+
+def _build_swear_matcher(words):
+    """Compiles the detection state used by count_swears()."""
+    # Longest first so the longest alternative wins; the alphabetical tiebreak
+    # makes the compiled pattern byte-identical from one process to the next.
+    ordered = sorted(words, key=lambda w: (-len(w), w))
+
+    prefilter = set()
+    unanchored = []
+    for entry in ordered:
+        token = _prefilter_key(entry)
+        if token is None:
+            unanchored.append(entry)
+        else:
+            prefilter.add(token)
+
+    full = re.compile(r'\b(' + '|'.join(map(re.escape, ordered)) + r')\b',
+                      re.IGNORECASE) if ordered else None
+    # Entries the prefilter cannot vouch for are always tested against this
+    # much smaller pattern.
+    always = re.compile(r'\b(' + '|'.join(map(re.escape, unanchored)) + r')\b',
+                        re.IGNORECASE) if unanchored else None
+    return full, always, prefilter
+
+
+SWEAR_PATTERN, SWEAR_ALWAYS_PATTERN, SWEAR_FIRST_TOKENS = _build_swear_matcher(SWEAR_WORDS)
+
+
+def count_swears(content: str) -> int:
+    """Returns how many tracked swear words appear in content."""
+    if not content or SWEAR_PATTERN is None:
+        return 0
+
+    # Prefilter: an entry can only match if its most selective token appears as
+    # a token of the message. Tokenising is linear and cheap; the full
+    # alternation is not. Ordinary chatter exits here.
+    tokens = {m.group(0).lower() for m in _WORD_RUN.finditer(content)}
+    if tokens.isdisjoint(SWEAR_FIRST_TOKENS):
+        if SWEAR_ALWAYS_PATTERN is None:
+            return 0
+        return len(SWEAR_ALWAYS_PATTERN.findall(content))
+
+    return len(SWEAR_PATTERN.findall(content))
+
+
+# ---------------------------------------------------------------------------
+# Discord embed limits. These are hard API limits, not tunables: exceeding any
+# of them makes the whole send fail with HTTP 400 and the message is lost.
+# ---------------------------------------------------------------------------
+EMBED_TITLE_LIMIT = 256
+EMBED_DESCRIPTION_LIMIT = 4096
+EMBED_FIELD_VALUE_LIMIT = 1024
+EMBED_FOOTER_LIMIT = 2048
+
+# Opening -> closing quote pairs, mirroring discord.ext.commands.view._quotes so
+# the slash-command path strips exactly what the prefix parser already strips.
+QUOTE_PAIRS = {
+    '"': '"', '‘': '’', '‚': '‛', '“': '”',
+    '„': '‟', '⹂': '⹂', '「': '」', '『': '』',
+    '〝': '〞', '﹁': '﹂', '﹃': '﹄', '＂': '＂',
+    '｢': '｣', '«': '»', '‹': '›', '《': '》',
+    '〈': '〉',
+}
+
+
+def clamp(text, limit: int, suffix: str = "…") -> str:
+    """Truncates text so it fits one of Discord's embed limits."""
+    text = "" if text is None else str(text)
+    if len(text) <= limit:
+        return text
+    if limit <= len(suffix):
+        return text[:limit]
+    return text[:limit - len(suffix)] + suffix
+
+
+def as_int(value, default: int = 0) -> int:
+    """Coerces a value loaded from JSON to an int, falling back to default.
+
+    The .json files are plain text on disk and may be hand-edited or predate the
+    current schema, so nothing read out of them is trusted to be the right type.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def normalize_word(word) -> str:
+    """Normalizes a word/phrase supplied by either command path.
+
+    The prefix parser strips surrounding quotes before a callback sees them, but
+    the app-command path passes the option value VERBATIM -- so
+    /watchword "lorem ipsum" used to store the quote characters as part of the
+    word, which could then never match message content. Strip matched surrounding
+    quotes and outer whitespace so both paths store the same thing.
+    """
+    if word is None:
+        return ""
+    word = str(word).strip()
+    while len(word) >= 2 and QUOTE_PAIRS.get(word[0]) == word[-1]:
+        word = word[1:-1].strip()
+    return word
+
+
+def word_lookup_keys(word) -> list:
+    """Ordered keys to try when looking up an already-watched word.
+
+    Entries added before quote-stripping existed can be stored with literal quote
+    characters, so the un-normalized form is tried as a fallback; without it those
+    entries could never be inspected, filtered or deleted.
+    """
+    keys = []
+    normalized = normalize_word(word).lower()
+    if normalized:
+        keys.append(normalized)
+    legacy = ("" if word is None else str(word)).strip().lower()
+    if legacy and legacy not in keys:
+        keys.append(legacy)
+    return keys
+
 
 def get_channel_id(channel_mention: str) -> int:
     """Extracts numeric channel ID from a discord channel mention string."""
-    match = re.search(r'\d+', channel_mention)
+    match = re.search(r'\d+', str(channel_mention))
     return int(match.group()) if match else 0
 
-def check_user(member: discord.Member):
-    """Given a member, check if they are in the dictionary. if not, create one for them."""
-    mem_id = str(member.id)
-    if mem_id not in bot.user_words:
-        bot.user_words[mem_id] = dict()
-        bot.user_cds[mem_id] = 15 * 60
-
-def check_server(member: discord.Member, server_id: str):
-    """Given a server ID, checks if it exists in the dictionary. Intended to be used after check_user"""
-    mem_id = str(member.id)
-    srv_id = str(server_id)
-    if srv_id not in bot.user_words[mem_id]:
-        bot.user_words[mem_id][srv_id] = dict()
-
-def ensure_valid_channels(member: discord.Member, server: discord.Guild, word: str):
-    """If a word's watched channel is nonexistent, removes it from the dict to prevent errors"""
-    result = dict()
-    mem_id = str(member.id)
-    srv_id = str(server.id)
-    if word not in bot.user_words[mem_id][srv_id].keys():
-        return
-    all_channels = [x.id for x in server.channels]
-    for channel_id in bot.user_words[mem_id][srv_id][word]["channels"].keys():
-        digits = get_channel_id(channel_id)
-        if digits in all_channels:
-            result[channel_id] = bot.static
-    bot.user_words[mem_id][srv_id][word]["channels"] = result
 
 def get_timeStamp() -> str:
     """Returns current time (hr:min:sec)"""
     return datetime.datetime.fromtimestamp(time.time()).strftime('%H:%M:%S')
 
-def write_to_json():
-    """Opens .json files and writes data into it"""
-    user_word_str = json.dumps(bot.user_words)
-    user_cd_str = json.dumps(bot.user_cds)
 
-    f = open(bot.user_words_file, "w+")
-    f.write(user_word_str)
-    f.close()
-    f = open(bot.user_cds_file, "w+")
-    f.write(user_cd_str)
-    f.close()
+def check_user(member: discord.Member):
+    """Ensures a member exists in both user dictionaries.
 
-    with open(bot.swear_counts_file, "w+") as f:
-        json.dump(bot.swear_counts, f)
-    with open(bot.leaderboards_file, "w+") as f:
-        json.dump(bot.leaderboards, f)
+    user_words and user_cds live in two separate files, so a user can legitimately
+    exist in one and be missing from the other (a crash between the two writes, a
+    restored backup, a hand-edited file). The two are therefore repaired
+    independently -- previously user_cds was only ever seeded inside the
+    "not in user_words" branch, which left /watched raising KeyError forever.
+    """
+    mem_id = str(member.id)
+    if not isinstance(bot.user_words.get(mem_id), dict):
+        bot.user_words[mem_id] = dict()
+    if mem_id not in bot.user_cds:
+        bot.user_cds[mem_id] = bot.default_cooldown_seconds
+
+
+def check_server(member: discord.Member, server_id: str):
+    """Ensures the member has a dict for this server. Use after check_user."""
+    mem_id = str(member.id)
+    srv_id = str(server_id)
+    if not isinstance(bot.user_words.get(mem_id), dict):
+        bot.user_words[mem_id] = dict()
+    if not isinstance(bot.user_words[mem_id].get(srv_id), dict):
+        bot.user_words[mem_id][srv_id] = dict()
+
+
+def get_server_words(member: discord.Member, server_id: str) -> dict:
+    """Returns the member's word dict for a server, creating/repairing as needed.
+
+    Single entry point for command callbacks, so no command indexes into
+    bot.user_words directly and risks a KeyError on unexpected persisted data.
+    """
+    check_user(member)
+    check_server(member, server_id)
+    return bot.user_words[str(member.id)][str(server_id)]
+
+
+def get_word_entry(words: dict, key: str) -> dict:
+    """Returns one word's entry, repairing anything the persisted file got wrong."""
+    entry = words.get(key)
+    if not isinstance(entry, dict):
+        entry = {"last_alerted": 0, "channels": dict()}
+        words[key] = entry
+    channels = entry.get("channels")
+    if isinstance(channels, (list, tuple, set)):
+        # Older/hand-written data stored channels as a list instead of a dict.
+        entry["channels"] = {str(x): bot.static for x in channels}
+    elif not isinstance(channels, dict):
+        entry["channels"] = dict()
+    return entry
+
+
+def find_watched_word(words: dict, word):
+    """Returns the key actually stored for a user-supplied word, or None."""
+    if not isinstance(words, dict):
+        return None
+    for key in word_lookup_keys(word):
+        if key in words:
+            return key
+    return None
+
+
+def get_user_cooldown(mem_id) -> int:
+    """Returns a user's alert cooldown in seconds, tolerating missing values."""
+    return max(0, as_int(bot.user_cds.get(str(mem_id)), bot.default_cooldown_seconds))
+
+
+def format_channel_names(channel_mentions) -> str:
+    """Renders stored channel mentions as #names, tolerating deleted channels."""
+    names = []
+    for mention in channel_mentions:
+        channel = bot.get_channel(get_channel_id(mention))
+        names.append("#" + (getattr(channel, "name", None) or "unknown-channel"))
+    return ", ".join(names)
+
+
+def valid_channel_mentions(args) -> bool:
+    """True when every argument looks like a channel mention."""
+    for channel in args:
+        if not (channel.startswith("<#") or channel.startswith("<!#")) or not channel.endswith(">"):
+            return False
+    return True
+
+
+async def send_missing_word(ctx, command_name: str):
+    """Reply used when a word argument is missing, empty, or only quotes."""
+    embed = discord.Embed(
+        title="No word or phrase given.",
+        description="Type it without quotes, for example `/{} lorem ipsum`.\n"
+                    "Use `/help` for full documentation.".format(command_name),
+        color=0x9f9f9f)
+    await ctx.send(embed=embed)
+
+
+async def send_bad_channels(ctx):
+    embed = discord.Embed(title="Invalid channel(s), use the \"#\" symbol to select channel.",
+                          color=0xe23a1d)
+    await ctx.send(embed=embed)
+
+
+async def send_not_watched(ctx, word: str):
+    embed = discord.Embed(
+        title=clamp("\"{}\" is not being watched.".format(word), EMBED_TITLE_LIMIT),
+        color=0xe23a1d)
+    await ctx.send(embed=embed)
+
+
+def ensure_valid_channels(member: discord.Member, server: discord.Guild, word: str):
+    """Drops filters pointing at channels that no longer exist."""
+    mem_id = str(member.id)
+    srv_id = str(server.id)
+    words = bot.user_words.get(mem_id)
+    if not isinstance(words, dict):
+        return
+    server_words = words.get(srv_id)
+    if not isinstance(server_words, dict) or word not in server_words:
+        return
+    entry = get_word_entry(server_words, word)
+    # Threads are not in guild.channels, so include them or a thread filter would
+    # be silently deleted the first time /worddetail runs.
+    all_channels = {x.id for x in server.channels} | {x.id for x in server.threads}
+    entry["channels"] = {cid: bot.static for cid in entry["channels"]
+                         if get_channel_id(cid) in all_channels}
+
+
+# Serializes saves so a periodic autosave and a swear-triggered save can never
+# write the same temp file at the same time.
+_save_lock = asyncio.Lock()
+
+
+def load_json(path: str, default=None):
+    """Reads JSON from `path`, returning `default` if it cannot be used.
+
+    A corrupt or unreadable data file must never crash the bot on boot with a
+    traceback, and must never be mistaken for "no data". Pass a fresh object as
+    `default` (usually `{}`), since it is returned as-is.
+    """
+    if default is None:
+        default = {}
+    if not os.path.isfile(path):
+        print("INFO: {} not found; starting with empty data.".format(path))
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        print("WARNING: {} is not valid JSON ({}); starting with empty data. "
+              "Back the file up now - the next save will overwrite it.".format(path, e))
+        return default
+    except OSError as e:
+        print("WARNING: could not read {} ({}); starting with empty data. "
+              "Back the file up now - the next save will overwrite it.".format(path, e))
+        return default
+    if not isinstance(data, type(default)):
+        print("WARNING: {} contains a JSON {}, expected {}; starting with empty data.".format(
+            path, type(data).__name__, type(default).__name__))
+        return default
+    return data
+
+
+def write_to_json() -> bool:
+    """Writes all bot data to disk atomically. Returns True on success.
+
+    Each file is written to `<path>.tmp`, flushed and fsync'd, then moved into
+    place with os.replace(), which is atomic on POSIX and on Windows. A crash or
+    SIGKILL therefore can never leave a truncated JSON file behind: the previous
+    copy survives untouched. All four payloads are staged before any file is
+    swapped in, which shrinks the window in which userwords.json and
+    usercds.json could disagree to a few consecutive rename syscalls.
+
+    Never raises. This is reachable from on_message(), where an exception would
+    take down message handling for every user.
+    """
+    targets = [
+        (USER_WORDS_FILE, bot.user_words),
+        (USER_CDS_FILE, bot.user_cds),
+        (SWEAR_COUNTS_FILE, bot.swear_counts),
+        (LEADERBOARDS_FILE, bot.leaderboards),
+    ]
+
+    staged = []
+    try:
+        for path, data in targets:
+            # Serialize first so an unserializable payload never touches disk.
+            payload = json.dumps(data)
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            staged.append((tmp, path))
+        for tmp, path in staged:
+            os.replace(tmp, path)
+    except (OSError, TypeError, ValueError) as e:
+        print("ERROR: could not save user data @ {}: {}".format(get_timeStamp(), e))
+        for tmp, _ in staged:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return False
 
     print("Saving user data @ {}".format(get_timeStamp()))
-
-@bot.hybrid_command()
-@commands.guild_only()
-async def cd(ctx, mins: float = 15.0):
-    """Set cooldown (in minutes) for each word. If no parameter, automatically defaults to 15 minutes"""
-    check_user(ctx.author)
-    if mins >= 0:
-        bot.user_cds[str(ctx.author.id)] = int(mins)*60
-        embed = discord.Embed(title="Notification cooldown set to {} min".format(int(mins)), color=0x39c12f)
-    else:
-        embed = discord.Embed(title="Minute cooldown must be positive.", color=0xe23a1d)
-    await ctx.send(embed=embed)
-
-@bot.hybrid_command()
-@commands.guild_only()
-async def deleteword(ctx, word: str = None):
-    """Deletes specified word from the user's pinged words"""
-    if word is None:
-        embed = discord.Embed(
-            title="Use /help for command documentation.", color=0x9f9f9f)
-        await ctx.send(embed=embed)
-        return
-
-    member = ctx.author
-    server_id = str(ctx.guild.id)
-
-    check_user(member)
-    check_server(member, server_id)
-
-    word = word.lower()
-
-    if len(bot.user_words[str(member.id)][server_id]) == 0:
-        embed = discord.Embed(title="You don't have any words added.", color=0xe23a1d)
-        await ctx.send(embed=embed)
-        return
-
-    if word in bot.user_words[str(member.id)][server_id].keys():
-        embed = discord.Embed(title="\"{}\" deleted from watch list".format(word), color=0x39c12f)
-        bot.user_words[str(member.id)][server_id].pop(word, None)
-        await ctx.send(embed=embed)
-        return
-
-    embed = discord.Embed(title="\"{}\" was not found on your watch list".format(word), color=0xe23a1d)
-    await ctx.send(embed=embed)
-
-@bot.hybrid_command()
-@commands.guild_only()
-async def watchclear(ctx):
-    """Clears all the user's watched words."""
-
-    member = ctx.author
-    server_id = str(ctx.guild.id)
-
-    check_user(member)
-    check_server(member, server_id)
-
-    bot.user_words[str(member.id)][server_id] = dict()
-
-    embed = discord.Embed(title="Your watch list is cleared.", color=0x39c12f)
-    await ctx.send(embed=embed)
-
-@bot.hybrid_command()
-@commands.guild_only()
-async def watchword(ctx, word: str = None, *, channels: str = ""):
-    """Adds word to user's watched list with timestamp. Optionally supports channel filtering."""
-    if word is None:
-        embed = discord.Embed(
-            title="Use /help for command documentation.", color=0x9f9f9f)
-        await ctx.send(embed=embed)
-        return
-
-    member = ctx.author
-    server_id = str(ctx.guild.id)
-
-    check_user(member)
-    check_server(member, server_id)
-
-    word = word.lower()
-
-    if word in bot.user_words[str(member.id)][server_id].keys():
-        embed = discord.Embed(title="You are already watching \"{}\"".format(word), color=0x39c12f)
-        await ctx.send(embed=embed)
-        return
-
-    args = channels.split() if channels else []
-    for channel in args:
-        if not (channel.startswith("<#") or channel.startswith("<!#")) or not channel.endswith(">"):
-            embed = discord.Embed(title="Invalid channel(s), use the \"#\" symbol to select channel.", color=0xe23a1d)
-            await ctx.send(embed=embed)
-            return
-
-    bot.user_words[str(member.id)][server_id][word] = {"last_alerted": calendar.timegm(time.gmtime()),
-                                                  "channels": {x: bot.static for x in args}}
-    if len(args) == 0:
-        embed = discord.Embed(title="\"{}\" added to watch list".format(word), color=0x39c12f)
-        embed.set_footer(
-            text="Watching entire server. Use /addfilter to only watch certain channels.")
-    else:
-        embed = discord.Embed(title="\"{}\" added to watch list".format(word), color=0x39c12f)
-        channel_names = []
-        for x in args:
-            chan_id = get_channel_id(x)
-            channel_obj = bot.get_channel(chan_id)
-            channel_names.append("#" + (channel_obj.name if channel_obj else "unknown-channel"))
-        embed.set_footer(text="Watching {}".format(", ".join(channel_names)))
-    await ctx.send(embed=embed)
-
-@bot.hybrid_command()
-@commands.guild_only()
-async def worddetail(ctx, word: str = None):
-    """Gives user details for a watched word or phrase."""
-    if word is None:
-        embed = discord.Embed(
-            title="Use /help for command documentation.", color=0x9f9f9f)
-        await ctx.send(embed=embed)
-        return
-
-    member = ctx.author
-    server_id = str(ctx.guild.id)
-
-    check_user(member)
-    check_server(member, server_id)
-
-    word = word.lower()
-    ensure_valid_channels(member, ctx.guild, word)
-
-    if word in bot.user_words[str(member.id)][server_id].keys():
-        data = bot.user_words[str(member.id)][server_id][word]
-        embed = discord.Embed(title="Word Details for {}".format(member.name), color=0xeb8d25)
-        embed.add_field(name="Word/Phrase", value=word, inline=False)
-        channel_names = []
-        for x in data["channels"].keys():
-            chan_id = get_channel_id(x)
-            channel_obj = bot.get_channel(chan_id)
-            channel_names.append("#" + (channel_obj.name if channel_obj else "unknown-channel"))
-        channels_watching = ", ".join(channel_names)
-        embed.add_field(name="Channels watching",
-                        value="All channels" if channels_watching == "" else channels_watching,
-                        inline=False)
-        current_time = calendar.timegm(time.gmtime())
-        embed.add_field(name="Last seen",
-                        value=str((current_time - data["last_alerted"])//60) + " min ago",
-                        inline=False)
-
-    else:
-        embed = discord.Embed(title="\"{}\" was not found on your watch list".format(word), color=0xe23a1d)
-    await ctx.send(embed=embed)
-
-@bot.hybrid_command()
-@commands.guild_only()
-async def addfilter(ctx, word: str = None, *, channels: str = ""):
-    """Adds filter to specified word"""
-    if word is None:
-        embed = discord.Embed(
-            title="Use /help for command documentation.", color=0x9f9f9f)
-        await ctx.send(embed=embed)
-        return
-
-    member = ctx.author
-    server_id = str(ctx.guild.id)
-
-    check_user(member)
-    check_server(member, server_id)
-
-    word = word.lower()
-
-    args = channels.split() if channels else []
-    if len(args) == 0:
-        embed = discord.Embed(title="No channels specified.", color=0xe23a1d)
-        await ctx.send(embed=embed)
-        return
-
-    for channel in args:
-        if not (channel.startswith("<#") or channel.startswith("<!#")) or not channel.endswith(">"):
-            embed = discord.Embed(title="Invalid channel(s), use the \"#\" symbol to select channel.", color=0xe23a1d)
-            await ctx.send(embed=embed)
-            return
-
-    if word in bot.user_words[str(member.id)][server_id].keys():
-        bot.user_words[str(member.id)][server_id][word]["channels"].update({x: bot.static for x in args})
-        channel_names = []
-        for x in args:
-            chan_id = get_channel_id(x)
-            channel_obj = bot.get_channel(chan_id)
-            channel_names.append("#" + (channel_obj.name if channel_obj else "unknown-channel"))
-        embed = discord.Embed(
-            title="{} added to \"{}\"".format(", ".join(channel_names), word),
-            color=0x39c12f)
-        await ctx.send(embed=embed)
-        return
-    embed = discord.Embed(title="\"{}\" is not being watched.".format(word), color=0xe23a1d)
-    await ctx.send(embed=embed)
-
-@bot.hybrid_command()
-@commands.guild_only()
-async def deletefilter(ctx, word: str = None, *, channels: str = ""):
-    """Removes filter from specified word"""
-    if word is None:
-        embed = discord.Embed(
-            title="Use /help for command documentation.", color=0x9f9f9f)
-        await ctx.send(embed=embed)
-        return
-
-    member = ctx.author
-    server_id = str(ctx.guild.id)
-
-    check_user(member)
-    check_server(member, server_id)
-
-    word = word.lower()
-
-    args = channels.split() if channels else []
-    if len(args) == 0:
-        embed = discord.Embed(title="No channels specified.", color=0xe23a1d)
-        await ctx.send(embed=embed)
-        return
-
-    for channel in args:
-        if not (channel.startswith("<#") or channel.startswith("<!#")) or not channel.endswith(">"):
-            embed = discord.Embed(title="Invalid channel(s), use the \"#\" symbol to select channel.", color=0xe23a1d)
-            await ctx.send(embed=embed)
-            return
-
-    if word in bot.user_words[str(member.id)][server_id].keys():
-        for to_remove in args:
-            bot.user_words[str(member.id)][server_id][word]["channels"].pop(to_remove, None)
-        channel_names = []
-        for x in args:
-            chan_id = get_channel_id(x)
-            channel_obj = bot.get_channel(chan_id)
-            channel_names.append("#" + (channel_obj.name if channel_obj else "unknown-channel"))
-        embed = discord.Embed(
-            title="{} removed from \"{}\"".format(", ".join(channel_names), word),
-            color=0x39c12f)
-        await ctx.send(embed=embed)
-        return
-    embed = discord.Embed(title="\"{}\" is not being watched.".format(word), color=0xe23a1d)
-    await ctx.send(embed=embed)
-
-@bot.hybrid_command()
-@commands.guild_only()
-async def clearfilter(ctx, word: str = None):
-    """Clears filter from specified word"""
-    if word is None:
-        embed = discord.Embed(
-            title="Use /help for command documentation.", color=0x9f9f9f)
-        await ctx.send(embed=embed)
-        return
-
-    member = ctx.author
-    server_id = str(ctx.guild.id)
-
-    check_user(member)
-    check_server(member, server_id)
-
-    word = word.lower()
-
-    if word in bot.user_words[str(member.id)][server_id].keys():
-        bot.user_words[str(member.id)][server_id][word]["channels"] = dict()
-        embed = discord.Embed(title="All filters removed from \"{}\"".format(word), color=0x39c12f)
-        embed.set_footer(text="Now watching entire server for word/phrase.")
-        await ctx.send(embed=embed)
-        return
-    embed = discord.Embed(title="\"{}\" is not being watched.".format(word), color=0xe23a1d)
-    await ctx.send(embed=embed)
-
-@bot.hybrid_command()
-@commands.guild_only()
-async def watched(ctx):
-    """Shows user a list of their watched words"""
-    member = ctx.author
-    server_id = str(ctx.guild.id)
-
-    check_user(member)
-    check_server(member, server_id)
-
-    if bot.user_words[str(member.id)][server_id] != dict():
-        watched_str = ""
-        for watchedword in bot.user_words[str(member.id)][server_id].keys():
-            watched_str += "\"{}\", ".format(watchedword)
-        watched_str = watched_str[:-2]
-    else:
-        watched_str = "No words or phrases currently watched."
-    embed = discord.Embed(
-        title="{}'s watched words/phrases".format(member.name), description=watched_str, color=0x76c7e9)
-    if member.display_avatar:
-        embed.set_thumbnail(url=member.display_avatar.url)
-    embed.set_footer(text="Notification Cooldown Preference: {} min".format(int(bot.user_cds[str(member.id)]/60)))
-    await ctx.send(embed=embed)
-
-async def make_swearboard_embed(guild: discord.Guild) -> discord.Embed:
-    guild_id_str = str(guild.id)
-    server_data = bot.swear_counts.get(guild_id_str, {})
-    
-    # Sort users by count descending
-    sorted_users = sorted(server_data.items(), key=lambda item: item[1], reverse=True)
-    
-    # Render table content
-    table_lines = []
-    table_lines.append("+------+----------------------+-------+")
-    table_lines.append("| Rank | User                 | Count |")
-    table_lines.append("+------+----------------------+-------+")
-    
-    rank = 1
-    for user_id_str, count in sorted_users[:15]:  # show top 15
-        user_name = "Unknown User"
-        try:
-            member = guild.get_member(int(user_id_str))
-            if not member:
-                member = await guild.fetch_member(int(user_id_str))
-            if member:
-                user_name = member.name
-        except Exception:
-            pass
-            
-        if len(user_name) > 18:
-            user_name = user_name[:15] + "..."
-            
-        line = f"| {rank:<4} | {user_name:<20} | {count:<5} |"
-        table_lines.append(line)
-        rank += 1
-        
-    if not sorted_users:
-        table_lines.append("| -    | No users yet         | -     |")
-        
-    table_lines.append("+------+----------------------+-------+")
-    
-    table_str = "\n".join(table_lines)
-    
-    embed = discord.Embed(title="🤬 Swear Word Leaderboard", color=0xe23a1d)
-    embed.description = f"```\n{table_str}\n```"
-    embed.set_footer(text=f"Updates in real-time. Tracking {len(SWEAR_WORDS)} words.")
-    return embed
-
-@bot.hybrid_command()
-@commands.guild_only()
-async def swearboard(ctx):
-    """Outputs a live-updating table of the top swearers in the server."""
-
-    embed = await make_swearboard_embed(ctx.guild)
-    msg = await ctx.send(embed=embed)
-    
-    # Store the leaderboard message info for updates
-    guild_id_str = str(ctx.guild.id)
-    bot.leaderboards[guild_id_str] = {
-        "channel_id": str(ctx.channel.id),
-        "message_id": str(msg.id)
-    }
-    write_to_json()
-
-@bot.hybrid_command()
-@commands.guild_only()
-@commands.has_permissions(administrator=True)
-async def swearreset(ctx):
-    """Resets the swear leaderboard for the current server. Admin only."""
-    guild_id_str = str(ctx.guild.id)
-    bot.swear_counts.pop(guild_id_str, None)
-    # Also remove the leaderboard message reference
-    bot.leaderboards.pop(guild_id_str, None)
-    write_to_json()
-    embed = discord.Embed(title="🗑️ Swear leaderboard has been reset.", color=0x39c12f)
-    await ctx.send(embed=embed)
-
-@bot.hybrid_command()
-@commands.guild_only()
-@commands.has_permissions(administrator=True)
-async def swearexport(ctx):
-    """Exports the server's swear leaderboard as a JSON file. Admin only."""
-    guild_id_str = str(ctx.guild.id)
-    server_data = bot.swear_counts.get(guild_id_str, {})
-
-    export_data = {
-        "guild_id": guild_id_str,
-        "guild_name": ctx.guild.name,
-        "exported_at": datetime.datetime.utcnow().isoformat() + "Z",
-        "swear_counts": server_data
-    }
-
-    json_str = json.dumps(export_data, indent=2)
-    file = discord.File(io.BytesIO(json_str.encode("utf-8")), filename=f"swearboard_{guild_id_str}.json")
-    embed = discord.Embed(title="📤 Swear leaderboard exported.", color=0x39c12f)
-    await ctx.send(embed=embed, file=file)
-
-@bot.hybrid_command()
-@commands.guild_only()
-@commands.has_permissions(administrator=True)
-async def swearimport(ctx, file: discord.Attachment = None):
-    """Imports swear leaderboard data from an attached JSON file. Admin only."""
-    if file is None:
-        embed = discord.Embed(title="❌ Please attach a JSON file to import.", color=0xe23a1d)
-        await ctx.send(embed=embed)
-        return
-
-    if not file.filename.endswith(".json"):
-        embed = discord.Embed(title="❌ File must be a .json file.", color=0xe23a1d)
-        await ctx.send(embed=embed)
-        return
-
-    if file.size > 1_000_000:  # 1MB limit
-        embed = discord.Embed(title="❌ File too large (max 1MB).", color=0xe23a1d)
-        await ctx.send(embed=embed)
-        return
-
-    try:
-        raw = await file.read()
-        data = json.loads(raw.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        embed = discord.Embed(title="❌ Invalid JSON file.", color=0xe23a1d)
-        await ctx.send(embed=embed)
-        return
-
-    # Validate structure
-    if not isinstance(data, dict) or "swear_counts" not in data:
-        embed = discord.Embed(title="❌ Invalid format: missing 'swear_counts' key.", color=0xe23a1d)
-        await ctx.send(embed=embed)
-        return
-
-    swear_counts = data["swear_counts"]
-    if not isinstance(swear_counts, dict):
-        embed = discord.Embed(title="❌ Invalid format: 'swear_counts' must be an object.", color=0xe23a1d)
-        await ctx.send(embed=embed)
-        return
-
-    # Validate all values are non-negative integers
-    for user_id, count in swear_counts.items():
-        if not isinstance(user_id, str) or not user_id.isdigit():
-            embed = discord.Embed(title=f"❌ Invalid user ID: '{user_id}'. Must be a numeric string.", color=0xe23a1d)
-            await ctx.send(embed=embed)
-            return
-        if not isinstance(count, int) or count < 0:
-            embed = discord.Embed(title=f"❌ Invalid count for user '{user_id}': must be a non-negative integer.", color=0xe23a1d)
-            await ctx.send(embed=embed)
-            return
-
-    guild_id_str = str(ctx.guild.id)
-    bot.swear_counts[guild_id_str] = swear_counts
-    write_to_json()
-
-    total_users = len(swear_counts)
-    total_swears = sum(swear_counts.values())
-    embed = discord.Embed(
-        title="📥 Swear leaderboard imported.",
-        description=f"Loaded **{total_users}** users with **{total_swears}** total swears.",
-        color=0x39c12f
-    )
-    await ctx.send(embed=embed)
-
-@bot.event
-async def on_message(message):
-    """Scans messages for key words/phrases and alerts any user that might be watching them"""
-    if message.author == bot.user:
-        return
-    current_time = calendar.timegm(time.gmtime())
-
-    # message.guild is None means it's a DM, which we shouldn't scan
-    if message.guild is not None:
-        guild_id_str = str(message.guild.id)
-        author_id_str = str(message.author.id)
-
-        # 1. Swear word detection & counting
-        if not message.author.bot:
-            matches = SWEAR_PATTERN.findall(message.content)
-            if matches:
-                if guild_id_str not in bot.swear_counts:
-                    bot.swear_counts[guild_id_str] = {}
-                if author_id_str not in bot.swear_counts[guild_id_str]:
-                    bot.swear_counts[guild_id_str][author_id_str] = 0
-
-                bot.swear_counts[guild_id_str][author_id_str] += len(matches)
-                bot.swear_dirty = True
-
-                # Debounced save: only write to disk every swear_save_frequency seconds
-                if current_time - bot.last_swear_save >= bot.swear_save_frequency:
-                    write_to_json()
-                    bot.swear_dirty = False
-                    bot.last_swear_save = current_time
-
-                # Trigger leaderboard update
-                if guild_id_str in bot.leaderboards:
-                    try:
-                        leaderboard_info = bot.leaderboards[guild_id_str]
-                        channel = bot.get_channel(int(leaderboard_info["channel_id"]))
-                        if channel:
-                            try:
-                                msg = await channel.fetch_message(int(leaderboard_info["message_id"]))
-                                updated_embed = await make_swearboard_embed(message.guild)
-                                await msg.edit(embed=updated_embed)
-                            except discord.NotFound:
-                                # Message deleted in Discord: clean up stale entry without error spam
-                                bot.leaderboards.pop(guild_id_str, None)
-                                write_to_json()
-                            except Exception as e:
-                                print(f"Could not edit leaderboard message: {e}")
-                                bot.leaderboards.pop(guild_id_str, None)
-                                write_to_json()
-                    except Exception as e:
-                        print(f"Error updating leaderboard: {e}")
-
-        # 2. Key words scanning & alerts
-        if not message.author.bot:
-            for mem in list(bot.user_words.keys()):
-                if guild_id_str in bot.user_words[mem]:
-                    for keyword, innerdict in list(bot.user_words[mem][guild_id_str].items()):
-                        # Make sure we don't alert if the author is the watcher themselves
-                        if author_id_str == mem:
-                            continue
-
-                        is_detected = keyword in message.content.lower()
-                        cooldown_expired = current_time - innerdict["last_alerted"] >= bot.user_cds.get(mem, 15*60)
-
-                        if is_detected and cooldown_expired:
-                            has_no_filters = len(innerdict["channels"]) == 0
-                            has_channel_filter = ("<#"+str(message.channel.id)+">" in innerdict["channels"]) or \
-                                                 ("<!#"+str(message.channel.id)+">" in innerdict["channels"])
-
-                            if has_no_filters or has_channel_filter:
-                                bot.user_words[mem][guild_id_str][keyword]["last_alerted"] = current_time
-                                try:
-                                    user = await bot.fetch_user(int(mem))
-                                    if user:
-                                        embed = discord.Embed(title="A watched word/phrase was detected!", color=0xeb8d25)
-                                        embed.set_thumbnail(url=bot.thumb)
-                                        embed.add_field(name="Server", value=message.guild.name, inline=False)
-                                        embed.add_field(name="Channel", value=message.channel.name, inline=False)
-                                        embed.add_field(name="Author", value=str(message.author), inline=False)
-                                        embed.add_field(name="Content", value=message.content, inline=False)
-                                        embed.add_field(name="Jump", value=f"[Go to message]({message.jump_url})", inline=False)
-                                        embed.set_footer(text="Detected message sent at {}".format(message.created_at))
-                                        await user.send(embed=embed)
-                                except Exception as e:
-                                    print(f"Error alerting user {mem}: {e}")
-
+    return True
+
+
+async def save_data() -> bool:
+    """Saves all bot data without blocking the event loop.
+
+    write_to_json() does blocking file I/O, so it runs in a worker thread. On
+    success the swear bookkeeping is cleared here, in one place, so that every
+    save path - periodic, debounced, or command-triggered - leaves
+    `swear_dirty` and `last_swear_save` consistent.
+    """
+    async with _save_lock:
+        ok = await asyncio.to_thread(write_to_json)
+        if ok:
+            bot.swear_dirty = False
+            bot.last_swear_save = calendar.timegm(time.gmtime())
+        return ok
+
+
+async def maybe_save_swears() -> bool:
+    """Debounced save for swear counts.
+
+    Writes only when there is something new to write (`swear_dirty`) and at most
+    once every SWEAR_SAVE_FREQUENCY seconds. Cheap enough to call on every
+    message.
+    """
+    if not bot.swear_dirty:
+        return False
+    if calendar.timegm(time.gmtime()) - bot.last_swear_save < SWEAR_SAVE_FREQUENCY:
+        return False
+    return await save_data()
 
 
 async def save_json():
     """Saves user data in JSON format periodically."""
     await bot.wait_until_ready()
     while not bot.is_closed():
-        await asyncio.sleep(bot.save_frequency)  # task runs every 900 seconds (15 mins)
-        write_to_json()
-        bot.swear_dirty = False
+        await asyncio.sleep(SAVE_FREQUENCY)
+        # Unconditional: watched words, filters and cooldowns are only ever
+        # persisted here, so this cannot be gated on swear_dirty. save_data()
+        # resets the swear bookkeeping, which stops the next swear from
+        # triggering a redundant write seconds after this one.
+        await save_data()
+
+
+# ---------------------------------------------------------------------------
+# Live swearboard
+#
+# The board used to be redrawn on every single swearing message: a fetch_message
+# plus an edit, per message. Discord allows roughly 5 message edits per 5s per
+# channel, so an active server sat on 429s. Worse, the old handler unregistered
+# the board on ANY exception -- a transient rate limit permanently killed it
+# until somebody re-ran /swearboard.
+#
+# Updates are now coalesced per guild: the first swear schedules a flush, later
+# swears inside the window mark the board dirty rather than editing, and the
+# flush redraws once when the window expires. Nothing is dropped, it is deferred.
+# ---------------------------------------------------------------------------
+
+
+def _leaderboard_lock(guild_id: str) -> asyncio.Lock:
+    lock = bot.leaderboard_locks.get(guild_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        bot.leaderboard_locks[guild_id] = lock
+    return lock
+
+
+def forget_leaderboard(guild_id: str) -> None:
+    """Drops every trace of a guild's board. Used on permanent failures only."""
+    bot.leaderboards.pop(guild_id, None)
+    bot.last_leaderboard_update.pop(guild_id, None)
+    bot.leaderboard_pending.discard(guild_id)
+    bot.leaderboard_messages.pop(guild_id, None)
+    bot.leaderboard_locks.pop(guild_id, None)
+
+
+async def _resolve_leaderboard_message(guild_id: str):
+    """Returns the board's Message, using a cached handle when we have one."""
+    cached = bot.leaderboard_messages.get(guild_id)
+    if cached is not None:
+        return cached
+    info = bot.leaderboards.get(guild_id)
+    if not isinstance(info, dict):
+        return None
+    channel = bot.get_channel(as_int(info.get("channel_id"), 0))
+    if channel is None:
+        return None
+    message = await channel.fetch_message(as_int(info.get("message_id"), 0))
+    bot.leaderboard_messages[guild_id] = message
+    return message
+
+
+async def _redraw_leaderboard(guild: discord.Guild) -> None:
+    """Edits a guild's board once. Only unregisters on permanent failures."""
+    guild_id = str(guild.id)
+    if guild_id not in bot.leaderboards:
+        return
+    try:
+        message = await _resolve_leaderboard_message(guild_id)
+        if message is None:
+            return
+        await message.edit(embed=await make_swearboard_embed(guild))
+        bot.last_leaderboard_update[guild_id] = calendar.timegm(time.gmtime())
+    except (discord.NotFound, discord.Forbidden) as e:
+        # Permanent: the message is gone, or we can no longer edit it. Clean up
+        # rather than retrying forever.
+        print("Swearboard for guild {} is unreachable ({}); unregistering it.".format(guild_id, e))
+        forget_leaderboard(guild_id)
+        await save_data()
+    except Exception as e:
+        # Transient (429, 5xx, connection reset). Keep the registration and drop
+        # any stale cached handle so the next attempt re-fetches.
+        bot.leaderboard_messages.pop(guild_id, None)
+        print("Could not edit swearboard for guild {} ({}); will retry.".format(guild_id, e))
+
+
+async def _flush_leaderboard(guild: discord.Guild) -> None:
+    """Waits out the debounce window, then redraws while the board is dirty."""
+    guild_id = str(guild.id)
+    async with _leaderboard_lock(guild_id):
+        while guild_id in bot.leaderboard_pending:
+            interval = max(0, as_int(bot.leaderboard_update_frequency, 30))
+            elapsed = calendar.timegm(time.gmtime()) - bot.last_leaderboard_update.get(guild_id, 0)
+            remaining = interval - elapsed
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+            # Clear before drawing: a swear arriving during the edit re-marks the
+            # board and the loop goes round again, so nothing is missed.
+            bot.leaderboard_pending.discard(guild_id)
+            await _redraw_leaderboard(guild)
+
+
+def schedule_leaderboard_update(guild: discord.Guild) -> None:
+    """Marks a guild's board dirty and ensures exactly one flush is pending."""
+    guild_id = str(guild.id)
+    if guild_id not in bot.leaderboards:
+        return
+    bot.leaderboard_pending.add(guild_id)
+    task = bot.leaderboard_tasks.get(guild_id)
+    if task is not None and not task.done():
+        return  # a flush is already scheduled; it will pick up this change
+    # Keep a strong reference: create_task only holds a weak one.
+    bot.leaderboard_tasks[guild_id] = asyncio.create_task(
+        _flush_leaderboard(guild), name="swearboard-{}".format(guild_id))
+
+
+async def make_swearboard_embed(guild: discord.Guild) -> discord.Embed:
+    """Renders the top swearers as a fixed-width table."""
+    guild_id_str = str(guild.id)
+    server_data = bot.swear_counts.get(guild_id_str, {})
+    if not isinstance(server_data, dict):
+        server_data = {}
+
+    sorted_users = sorted(server_data.items(),
+                          key=lambda item: (-as_int(item[1], 0), str(item[0])))
+
+    table_lines = ["+------+----------------------+-------+",
+                   "| Rank | User                 | Count |",
+                   "+------+----------------------+-------+"]
+
+    for rank, (user_id_str, count) in enumerate(sorted_users[:15], start=1):
+        # Cache only. The old code awaited guild.fetch_member() per uncached row,
+        # up to 15 HTTP calls per redraw, inside a bare `except: pass`.
+        member = guild.get_member(as_int(user_id_str, 0))
+        user_name = member.name if member is not None else "Unknown User"
+        if len(user_name) > 20:
+            user_name = user_name[:17] + "..."
+        table_lines.append("| {:<4} | {:<20} | {:<5} |".format(
+            rank, user_name, as_int(count, 0)))
+
+    if not sorted_users:
+        table_lines.append("| -    | No users yet         | -     |")
+
+    table_lines.append("+------+----------------------+-------+")
+
+    embed = discord.Embed(title="🤬 Swear Word Leaderboard", color=0xe23a1d)
+    embed.description = "```\n{}\n```".format("\n".join(table_lines))
+    embed.set_footer(text="Updates about every {}s. Tracking {} words.".format(
+        max(0, as_int(bot.leaderboard_update_frequency, 30)), len(SWEAR_WORDS)))
+    return embed
+
+
+@bot.hybrid_command()
+async def help(ctx):
+    """Shows the bot documentation in this channel"""
+    # Posted in-channel, not by DM: ctx.author.send() raises discord.Forbidden for
+    # anyone with DMs closed, which made /help fail outright for those users.
+    core = discord.Embed(title="WordWatch Bot Commands",
+                         description=help_str.description_str,
+                         color=0x30abc0)
+    core.set_thumbnail(url=bot.thumb)
+    core.add_field(name="How words are matched",
+                   value=help_str.usage_str.format(min_length=bot.min_watchword_length),
+                   inline=False)
+    core.add_field(name="/help", value=help_str.help_cmd_str, inline=False)
+    core.add_field(name="/watched [page]", value=help_str.watched_str, inline=False)
+    core.add_field(name="/watchword <word> [channels]", value=help_str.watchword_str, inline=False)
+    core.add_field(name="/deleteword <word>", value=help_str.deleteword_str, inline=False)
+    core.add_field(name="/watchclear", value=help_str.watchclear_str, inline=False)
+    core.add_field(name="/cd [minutes]",
+                   value=help_str.cd_str.format(default_cd=bot.default_cooldown_minutes),
+                   inline=False)
+    core.add_field(name="/worddetail <word>", value=help_str.worddetail_str, inline=False)
+    core.add_field(name="/addfilter <word> [channels]", value=help_str.addfilter_str, inline=False)
+    core.add_field(name="/deletefilter <word> [channels]", value=help_str.deletefilter_str, inline=False)
+    core.add_field(name="/clearfilter <word>", value=help_str.clearfilter_str, inline=False)
+    core.set_footer(text=help_str.footer_str)
+
+    extras = discord.Embed(title="WordWatch Bot — Swear Tracking & Admin",
+                           description=help_str.admin_description_str,
+                           color=0xa3a3a3)
+    extras.add_field(name="/swearboard", value=help_str.swearboard_str, inline=False)
+    extras.add_field(name="/swearreset  (Admin only)", value=help_str.swearreset_str, inline=False)
+    extras.add_field(name="/swearexport  (Admin only)", value=help_str.swearexport_str, inline=False)
+    extras.add_field(name="/swearimport <file>  (Admin only)", value=help_str.swearimport_str, inline=False)
+    extras.add_field(name="/forcesave  (Admin only)", value=help_str.forcesave_str, inline=False)
+    extras.add_field(name="/botstop  (Admin only)", value=help_str.botstop_str, inline=False)
+    extras.set_footer(text=help_str.admin_footer_str)
+
+    # 16 commands over 2 embeds: 11 and 6 fields (cap 25 each), well under the
+    # 6000-character cap per embed and across the message.
+    await ctx.send(embeds=[core, extras])
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+async def cd(ctx, mins: float = None):
+    """Set cooldown (in minutes) for each word. With no parameter, uses the default"""
+    check_user(ctx.author)
+    if mins is None:
+        mins = float(bot.default_cooldown_minutes)
+    if mins < 0:
+        embed = discord.Embed(title="Minute cooldown cannot be negative.", color=0xe23a1d)
+    else:
+        bot.user_cds[str(ctx.author.id)] = int(mins) * 60
+        embed = discord.Embed(title="Notification cooldown set to {} min".format(int(mins)),
+                              color=0x39c12f)
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+async def deleteword(ctx, word: str = None):
+    """Deletes specified word from the user's pinged words"""
+    words = get_server_words(ctx.author, str(ctx.guild.id))
+
+    normalized = normalize_word(word).lower()
+    if not normalized:
+        await send_missing_word(ctx, "deleteword")
+        return
+
+    if len(words) == 0:
+        await ctx.send(embed=discord.Embed(title="You don't have any words added.", color=0xe23a1d))
+        return
+
+    # find_watched_word also matches entries stored with literal quotes by the old
+    # slash-command path, so those remain deletable.
+    stored_key = find_watched_word(words, word)
+    if stored_key is not None:
+        words.pop(stored_key, None)
+        await ctx.send(embed=discord.Embed(
+            title=clamp("\"{}\" deleted from watch list".format(stored_key), EMBED_TITLE_LIMIT),
+            color=0x39c12f))
+        return
+
+    await ctx.send(embed=discord.Embed(
+        title=clamp("\"{}\" was not found on your watch list".format(normalized), EMBED_TITLE_LIMIT),
+        color=0xe23a1d))
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+async def watchclear(ctx):
+    """Clears all the user's watched words."""
+    check_user(ctx.author)
+    check_server(ctx.author, str(ctx.guild.id))
+    bot.user_words[str(ctx.author.id)][str(ctx.guild.id)] = dict()
+    await ctx.send(embed=discord.Embed(title="Your watch list is cleared.", color=0x39c12f))
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+async def watchword(ctx, word: str = None, *, channels: str = ""):
+    """Adds word to user's watched list. Optionally supports channel filtering."""
+    words = get_server_words(ctx.author, str(ctx.guild.id))
+
+    word = normalize_word(word)
+    if not word:
+        await send_missing_word(ctx, "watchword")
+        return
+
+    # Matching is substring-based and case-insensitive ("ass" matches "class"),
+    # which is intentional -- but it means a 1-2 character word matches nearly
+    # every message and floods the watcher's DMs, so enforce a floor.
+    min_length = max(1, as_int(bot.min_watchword_length, 3))
+    if len(word) < min_length:
+        await ctx.send(embed=discord.Embed(
+            title=clamp("\"{}\" is too short to watch.".format(word), EMBED_TITLE_LIMIT),
+            description="Watched words must be at least **{}** characters long. Words match "
+                        "anywhere inside a message, so shorter ones match almost everything "
+                        "and would flood your DMs.".format(min_length),
+            color=0xe23a1d))
+        return
+
+    word = word.lower()
+    if find_watched_word(words, word) is not None:
+        await ctx.send(embed=discord.Embed(
+            title=clamp("You are already watching \"{}\"".format(word), EMBED_TITLE_LIMIT),
+            color=0x39c12f))
+        return
+
+    args = channels.split() if channels else []
+    if not valid_channel_mentions(args):
+        await send_bad_channels(ctx)
+        return
+
+    words[word] = {"last_alerted": calendar.timegm(time.gmtime()),
+                   "channels": {x: bot.static for x in args}}
+
+    embed = discord.Embed(
+        title=clamp("\"{}\" added to watch list".format(word), EMBED_TITLE_LIMIT), color=0x39c12f)
+    if len(args) == 0:
+        embed.set_footer(text="Watching entire server. Use /addfilter to only watch certain channels.")
+    else:
+        embed.set_footer(text=clamp("Watching {}".format(format_channel_names(args)), EMBED_FOOTER_LIMIT))
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+async def worddetail(ctx, word: str = None):
+    """Gives user details for a watched word or phrase."""
+    words = get_server_words(ctx.author, str(ctx.guild.id))
+
+    normalized = normalize_word(word).lower()
+    if not normalized:
+        await send_missing_word(ctx, "worddetail")
+        return
+
+    stored_key = find_watched_word(words, word)
+    if stored_key is None:
+        await ctx.send(embed=discord.Embed(
+            title=clamp("\"{}\" was not found on your watch list".format(normalized), EMBED_TITLE_LIMIT),
+            color=0xe23a1d))
+        return
+
+    ensure_valid_channels(ctx.author, ctx.guild, stored_key)
+    data = get_word_entry(words, stored_key)
+
+    embed = discord.Embed(
+        title=clamp("Word Details for {}".format(ctx.author.name), EMBED_TITLE_LIMIT), color=0xeb8d25)
+    embed.add_field(name="Word/Phrase", value=clamp(stored_key, EMBED_FIELD_VALUE_LIMIT), inline=False)
+    channels_watching = format_channel_names(data["channels"].keys())
+    embed.add_field(name="Channels watching",
+                    value=clamp(channels_watching or "All channels", EMBED_FIELD_VALUE_LIMIT),
+                    inline=False)
+    last_alerted = as_int(data.get("last_alerted"), 0)
+    if last_alerted <= 0:
+        last_seen = "Never"
+    else:
+        last_seen = "{} min ago".format(max(0, (calendar.timegm(time.gmtime()) - last_alerted) // 60))
+    embed.add_field(name="Last seen", value=last_seen, inline=False)
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+async def addfilter(ctx, word: str = None, *, channels: str = ""):
+    """Adds filter to specified word"""
+    words = get_server_words(ctx.author, str(ctx.guild.id))
+
+    normalized = normalize_word(word).lower()
+    if not normalized:
+        await send_missing_word(ctx, "addfilter")
+        return
+    # No minimum-length check here on purpose: the word must already be on the
+    # watch list, so it already passed /watchword's validation.
+
+    args = channels.split() if channels else []
+    if len(args) == 0:
+        await ctx.send(embed=discord.Embed(title="No channels specified.", color=0xe23a1d))
+        return
+    if not valid_channel_mentions(args):
+        await send_bad_channels(ctx)
+        return
+
+    stored_key = find_watched_word(words, word)
+    if stored_key is None:
+        await send_not_watched(ctx, normalized)
+        return
+
+    get_word_entry(words, stored_key)["channels"].update({x: bot.static for x in args})
+    await ctx.send(embed=discord.Embed(
+        title=clamp("{} added to \"{}\"".format(format_channel_names(args), stored_key), EMBED_TITLE_LIMIT),
+        color=0x39c12f))
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+async def deletefilter(ctx, word: str = None, *, channels: str = ""):
+    """Removes filter from specified word"""
+    words = get_server_words(ctx.author, str(ctx.guild.id))
+
+    normalized = normalize_word(word).lower()
+    if not normalized:
+        await send_missing_word(ctx, "deletefilter")
+        return
+
+    args = channels.split() if channels else []
+    if len(args) == 0:
+        await ctx.send(embed=discord.Embed(title="No channels specified.", color=0xe23a1d))
+        return
+    if not valid_channel_mentions(args):
+        await send_bad_channels(ctx)
+        return
+
+    stored_key = find_watched_word(words, word)
+    if stored_key is None:
+        await send_not_watched(ctx, normalized)
+        return
+
+    entry = get_word_entry(words, stored_key)
+    for to_remove in args:
+        entry["channels"].pop(to_remove, None)
+    await ctx.send(embed=discord.Embed(
+        title=clamp("{} removed from \"{}\"".format(format_channel_names(args), stored_key), EMBED_TITLE_LIMIT),
+        color=0x39c12f))
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+async def clearfilter(ctx, word: str = None):
+    """Clears filter from specified word"""
+    words = get_server_words(ctx.author, str(ctx.guild.id))
+
+    normalized = normalize_word(word).lower()
+    if not normalized:
+        await send_missing_word(ctx, "clearfilter")
+        return
+
+    stored_key = find_watched_word(words, word)
+    if stored_key is None:
+        await send_not_watched(ctx, normalized)
+        return
+
+    get_word_entry(words, stored_key)["channels"] = dict()
+    embed = discord.Embed(
+        title=clamp("All filters removed from \"{}\"".format(stored_key), EMBED_TITLE_LIMIT),
+        color=0x39c12f)
+    embed.set_footer(text="Now watching entire server for word/phrase.")
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+async def watched(ctx, page: int = 1):
+    """Shows user a list of their watched words, one page at a time"""
+    member = ctx.author
+    words = sorted(get_server_words(member, str(ctx.guild.id)).keys())
+    total = len(words)
+    page_size = max(1, as_int(bot.watched_page_size, 50))
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    # get_user_cooldown() instead of bot.user_cds[...]: the two data files are
+    # saved separately, so the cooldown entry can legitimately be missing.
+    cooldown_str = "Notification Cooldown Preference: {} min".format(get_user_cooldown(member.id) // 60)
+
+    if total == 0:
+        embed = discord.Embed(
+            title=clamp("{}'s watched words/phrases".format(member.name), EMBED_TITLE_LIMIT),
+            description="No words or phrases currently watched.", color=0x76c7e9)
+        if member.display_avatar:
+            embed.set_thumbnail(url=member.display_avatar.url)
+        embed.set_footer(text=clamp(cooldown_str, EMBED_FOOTER_LIMIT))
+        await ctx.send(embed=embed)
+        return
+
+    if page < 1 or page > total_pages:
+        await ctx.send(embed=discord.Embed(
+            title=clamp("Page {} doesn't exist.".format(page), EMBED_TITLE_LIMIT),
+            description="You are watching **{}** word(s) on this server, which is **{}** "
+                        "page(s). Try `/watched page:1`.".format(total, total_pages),
+            color=0xe23a1d))
+        return
+
+    page_words = words[(page - 1) * page_size:(page - 1) * page_size + page_size]
+
+    # Descriptions are capped at 4096 characters. Paging by count is not enough on
+    # its own, because a single watched phrase can itself be very long, so the
+    # rendered lines are also kept inside a character budget.
+    budget = EMBED_DESCRIPTION_LIMIT - 200
+    lines, used, hidden = [], 0, 0
+    for index, watchedword in enumerate(page_words):
+        line = "• " + discord.utils.escape_markdown(str(watchedword))
+        if used + len(line) + 1 > budget:
+            hidden = len(page_words) - index
+            break
+        lines.append(line)
+        used += len(line) + 1
+
+    watched_str = "\n".join(lines)
+    if hidden:
+        notice = "*{} more on this page were too long to display.*".format(hidden)
+        watched_str = (watched_str + "\n\n" + notice) if watched_str else notice
+
+    embed = discord.Embed(
+        title=clamp("{}'s watched words/phrases".format(member.name), EMBED_TITLE_LIMIT),
+        description=clamp(watched_str, EMBED_DESCRIPTION_LIMIT), color=0x76c7e9)
+    if member.display_avatar:
+        embed.set_thumbnail(url=member.display_avatar.url)
+    if total_pages > 1:
+        embed.add_field(
+            name="⚠️ Your list spans several pages",
+            value=clamp("Showing **{}** of **{}** watched words. Use `/watched page:<number>` "
+                        "to see the rest (pages 1-{}).".format(len(lines), total, total_pages),
+                        EMBED_FIELD_VALUE_LIMIT),
+            inline=False)
+    embed.set_footer(text=clamp("Page {} of {} • {} word(s) total • {}".format(
+        page, total_pages, total, cooldown_str), EMBED_FOOTER_LIMIT))
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+async def swearboard(ctx):
+    """Outputs a live-updating table of the top swearers in the server."""
+    msg = await ctx.send(embed=await make_swearboard_embed(ctx.guild))
+
+    guild_id_str = str(ctx.guild.id)
+    bot.leaderboards[guild_id_str] = {"channel_id": str(ctx.channel.id),
+                                      "message_id": str(msg.id)}
+    bot.leaderboard_messages[guild_id_str] = msg
+    bot.last_leaderboard_update[guild_id_str] = calendar.timegm(time.gmtime())
+    await save_data()
+
 
 @bot.hybrid_command()
 @commands.guild_only()
 @commands.has_permissions(administrator=True)
+@discord.app_commands.default_permissions(administrator=True)
+async def swearreset(ctx):
+    """Resets the swear leaderboard for the current server. Admin only."""
+    guild_id_str = str(ctx.guild.id)
+    bot.swear_counts.pop(guild_id_str, None)
+    forget_leaderboard(guild_id_str)
+    await save_data()
+    await ctx.send(embed=discord.Embed(title="🗑️ Swear leaderboard has been reset.", color=0x39c12f))
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@commands.has_permissions(administrator=True)
+@discord.app_commands.default_permissions(administrator=True)
+async def swearexport(ctx):
+    """Exports the server's swear leaderboard as a JSON file. Admin only."""
+    guild_id_str = str(ctx.guild.id)
+    export_data = {
+        "guild_id": guild_id_str,
+        "guild_name": ctx.guild.name,
+        "exported_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "swear_counts": bot.swear_counts.get(guild_id_str, {}),
+    }
+    file = discord.File(io.BytesIO(json.dumps(export_data, indent=2).encode("utf-8")),
+                        filename="swearboard_{}.json".format(guild_id_str))
+    await ctx.send(embed=discord.Embed(title="📤 Swear leaderboard exported.", color=0x39c12f), file=file)
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@commands.has_permissions(administrator=True)
+@discord.app_commands.default_permissions(administrator=True)
+async def swearimport(ctx, file: discord.Attachment = None):
+    """Imports swear leaderboard data from an attached JSON file. Admin only."""
+    async def fail(title):
+        await ctx.send(embed=discord.Embed(title=title, color=0xe23a1d))
+
+    if file is None:
+        await fail("❌ Please attach a JSON file to import.")
+        return
+    if not file.filename.endswith(".json"):
+        await fail("❌ File must be a .json file.")
+        return
+    if file.size > bot.max_import_bytes:
+        await fail("❌ File too large (max {} bytes).".format(bot.max_import_bytes))
+        return
+
+    try:
+        data = json.loads((await file.read()).decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        await fail("❌ Invalid JSON file.")
+        return
+
+    if not isinstance(data, dict) or "swear_counts" not in data:
+        await fail("❌ Invalid format: missing 'swear_counts' key.")
+        return
+
+    swear_counts = data["swear_counts"]
+    if not isinstance(swear_counts, dict):
+        await fail("❌ Invalid format: 'swear_counts' must be an object.")
+        return
+
+    for user_id, count in swear_counts.items():
+        if not isinstance(user_id, str) or not user_id.isdigit():
+            await fail("❌ Invalid user ID: '{}'. Must be a numeric string.".format(user_id))
+            return
+        # bool is a subclass of int, so it is excluded explicitly.
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            await fail("❌ Invalid count for user '{}': must be a non-negative integer.".format(user_id))
+            return
+
+    bot.swear_counts[str(ctx.guild.id)] = swear_counts
+    await save_data()
+    schedule_leaderboard_update(ctx.guild)
+
+    await ctx.send(embed=discord.Embed(
+        title="📥 Swear leaderboard imported.",
+        description="Loaded **{}** users with **{}** total swears.".format(
+            len(swear_counts), sum(swear_counts.values())),
+        color=0x39c12f))
+
+
+@bot.hybrid_command()
+@commands.guild_only()
+@commands.has_permissions(administrator=True)
+@discord.app_commands.default_permissions(administrator=True)
 async def forcesave(ctx):
-    """Forces the bot to write current saved user data into their respective JSON files."""
+    """Forces the bot to write current user data into the JSON files. Admin only."""
+    ok = await save_data()
+    await ctx.send(embed=discord.Embed(
+        title="Force save complete." if ok else "Force save FAILED - check the bot logs.",
+        color=0x39c12f if ok else 0xe23a1d))
 
-    write_to_json()
-
-    embed = discord.Embed(title="Force save complete.", color=0x39c12f)
-    await ctx.send(embed=embed)
 
 @bot.hybrid_command()
 @commands.guild_only()
 @commands.has_permissions(administrator=True)
+@discord.app_commands.default_permissions(administrator=True)
 async def botstop(ctx):
-    """Turns off the bot"""
-
-    embed = discord.Embed(title="WordWatch Bot saving data and logging out.", color=0xe23a1d)
-    await ctx.send(embed=embed)
+    """Saves data and logs the bot out. Admin only."""
+    await ctx.send(embed=discord.Embed(title="WordWatch Bot saving data and logging out.",
+                                       color=0xe23a1d))
     print("Saving before logging out...")
-    write_to_json()
+    await save_data()
     print("Done.")
     await bot.close()
 
-@bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: discord.app_commands.AppCommandError):
-    msg = f"❌ An error occurred: {error}"
-    if isinstance(error, discord.app_commands.errors.CommandInvokeError) and isinstance(error.original, commands.NoPrivateMessage):
-        msg = "❌ This command can only be used in servers."
-    if interaction.response.is_done():
-        await interaction.followup.send(msg, ephemeral=True)
-    else:
-        await interaction.response.send_message(msg, ephemeral=True)
+
+def build_alert_embed(message: discord.Message) -> discord.Embed:
+    """Builds the DM alert embed, with every part clamped to its Discord limit.
+
+    Embed field values are capped at 1024 characters while a message body runs to
+    2000 (4000 with Nitro), so an unclamped Content field made the DM fail with
+    HTTP 400 and the alert was lost. Everything interpolated here is user- or
+    server-controlled, so each part is clamped rather than trusted.
+    """
+    content_limit = min(as_int(bot.alert_content_max_chars, 1000), EMBED_FIELD_VALUE_LIMIT)
+    channel_name = getattr(message.channel, "name", None) or "unknown-channel"
+
+    embed = discord.Embed(title="A watched word/phrase was detected!", color=0xeb8d25)
+    embed.set_thumbnail(url=bot.thumb)
+    embed.add_field(name="Server", value=clamp(message.guild.name, EMBED_FIELD_VALUE_LIMIT), inline=False)
+    embed.add_field(name="Channel", value=clamp(channel_name, EMBED_FIELD_VALUE_LIMIT), inline=False)
+    embed.add_field(name="Author", value=clamp(str(message.author), EMBED_FIELD_VALUE_LIMIT), inline=False)
+    # An empty field value is also rejected by Discord (attachment-only message).
+    embed.add_field(name="Content",
+                    value=clamp(message.content, content_limit) or "*(no text content)*",
+                    inline=False)
+    embed.add_field(name="Jump",
+                    value=clamp("[Go to message]({})".format(message.jump_url), EMBED_FIELD_VALUE_LIMIT),
+                    inline=False)
+    embed.set_footer(text=clamp("Detected message sent at {}".format(message.created_at), EMBED_FOOTER_LIMIT))
+    return embed
 
 
+def commit_last_alerted(mem: str, server_id: str, keyword: str, when: int):
+    """Records a successful alert, but only if the watcher still watches that word.
 
-async def custom_setup():
-    bot.loop.create_task(save_json())
+    on_message awaits between snapshotting the word dict and writing back to it, so
+    a concurrent /deleteword or /watchclear can remove the entry in between.
+    Re-indexing it blindly raised KeyError out of on_message entirely, abandoning
+    every remaining watcher for that message.
+    """
+    guilds = bot.user_words.get(mem)
+    if not isinstance(guilds, dict):
+        return
+    words = guilds.get(server_id)
+    if not isinstance(words, dict):
+        return
+    entry = words.get(keyword)
+    if isinstance(entry, dict):
+        entry["last_alerted"] = when
+
+
+@bot.event
+async def on_message(message):
+    """Scans messages for key words/phrases and alerts any user watching them"""
+    if message.author == bot.user:
+        return
+
+    # commands.BotBase.on_message is nothing but `await self.process_commands(...)`.
+    # Registering this function with @bot.event REPLACES that method, so without
+    # this call every prefix (mention) invocation of all 16 hybrid commands is dead.
+    # It sits at function level, not inside the guild check below, because the
+    # prefix is commands.when_mentioned, which works in DMs too. No extra author
+    # guard is needed: process_commands already starts with `if message.author.bot`.
+    await bot.process_commands(message)
+
+    current_time = calendar.timegm(time.gmtime())
+
+    # message.guild is None means it's a DM, which we shouldn't scan
+    if message.guild is None or message.author.bot:
+        return
+
+    guild_id_str = str(message.guild.id)
+    author_id_str = str(message.author.id)
+
+    # 1. Swear word detection & counting
+    hits = count_swears(message.content)
+    if hits:
+        guild_counts = bot.swear_counts.setdefault(guild_id_str, {})
+        guild_counts[author_id_str] = as_int(guild_counts.get(author_id_str), 0) + hits
+        bot.swear_dirty = True
+        # Coalesced: marks the board dirty and lets one scheduled flush redraw it.
+        schedule_leaderboard_update(message.guild)
+
+    # Debounced save: writes at most once every SWEAR_SAVE_FREQUENCY seconds, and
+    # only when there is something new to write.
+    await maybe_save_swears()
+
+    # 2. Key words scanning & alerts
+    lowered_content = message.content.lower()
+    for mem in list(bot.user_words.keys()):
+        # Never alert the author about their own message.
+        if author_id_str == mem:
+            continue
+
+        # Nothing below indexes the persisted structure directly: userwords.json is
+        # hand-editable and may predate the current schema, and a single KeyError
+        # here used to escape on_message and kill alerting entirely.
+        guilds = bot.user_words.get(mem)
+        if not isinstance(guilds, dict):
+            continue
+        server_words = guilds.get(guild_id_str)
+        if not isinstance(server_words, dict):
+            continue
+
+        for keyword, innerdict in list(server_words.items()):
+            if not isinstance(keyword, str) or not keyword.strip():
+                continue  # a legacy empty key would match every single message
+            if not isinstance(innerdict, dict):
+                innerdict = {}
+
+            if keyword not in lowered_content:
+                continue
+
+            last_alerted = as_int(innerdict.get("last_alerted"), 0)
+            if current_time - last_alerted < get_user_cooldown(mem):
+                continue
+
+            channels = innerdict.get("channels")
+            if not isinstance(channels, (dict, list, tuple, set)):
+                channels = {}
+            has_no_filters = len(channels) == 0
+            has_channel_filter = ("<#" + str(message.channel.id) + ">" in channels) or \
+                                 ("<!#" + str(message.channel.id) + ">" in channels)
+            if not (has_no_filters or has_channel_filter):
+                continue
+
+            try:
+                # Cache first: fetch_user is a full HTTP round trip, once per alert,
+                # and the watcher is normally already cached.
+                user = bot.get_user(int(mem))
+                if user is None:
+                    user = await bot.fetch_user(int(mem))
+                if user:
+                    await user.send(embed=build_alert_embed(message))
+                    # Cooldown is spent only once the DM actually landed.
+                    commit_last_alerted(mem, guild_id_str, keyword, current_time)
+            except discord.Forbidden:
+                # DMs closed or bot blocked: this can never succeed, so spend the
+                # cooldown anyway rather than taking a 403 on every matching message.
+                commit_last_alerted(mem, guild_id_str, keyword, current_time)
+                print("Cannot DM user {}: DMs closed or bot blocked.".format(mem))
+            except Exception as e:
+                # Transient failure: leave last_alerted alone so the next matching
+                # message retries instead of silently skipping.
+                print("Error alerting user {}: {}".format(mem, e))
+
+
+def load_data():
+    """Loads every persisted structure from disk.
+
+    Called once from WordWatchBot.setup_hook. Guarded so a second call is a no-op:
+    reloading after the bot has been running would silently discard in-memory
+    state, which is exactly what doing this in on_ready used to cause on every
+    gateway reconnect.
+    """
+    if bot._data_loaded:
+        return
+
+    bot.user_words = load_json(USER_WORDS_FILE, {})
+    bot.user_cds = load_json(USER_CDS_FILE, {})
+    bot.swear_counts = load_json(SWEAR_COUNTS_FILE, {})
+    bot.leaderboards = load_json(LEADERBOARDS_FILE, {})
+
+    # The two user structures are written separately, so a crash between the two
+    # writes can leave a user present in one and missing from the other.
+    for mem_id in bot.user_words:
+        bot.user_cds.setdefault(mem_id, DEFAULT_COOLDOWN_SECONDS)
+
+    bot._data_loaded = True
+    print("Data loaded: {} user(s), {} guild(s) with swear counts, {} leaderboard(s).".format(
+        len(bot.user_words), len(bot.swear_counts), len(bot.leaderboards)))
+
+
+@bot.event
+async def on_ready():
+    """Fires on first login AND on every RESUME/reconnect.
+
+    Everything here must therefore be cheap and idempotent. Data loading lives in
+    WordWatchBot.setup_hook - doing it here rolled back up to SAVE_FREQUENCY
+    seconds of in-memory state every time the gateway blipped.
+    """
+    await bot.change_presence(activity=discord.Game(name="Questions? Type /help"))
+    print("Logged in as {} (id: {}) - connected to {} guild(s).".format(
+        bot.user, bot.user.id, len(bot.guilds)))
+
+
+@bot.event
+async def on_guild_remove(guild: discord.Guild):
+    """Purges a guild's data when the bot is kicked, banned, or the guild is deleted.
+
+    Not the same as an outage: an unreachable guild fires on_guild_unavailable, so
+    this only runs for a real removal.
+    """
+    guild_id_str = str(guild.id)
+
+    watchers_cleared = words_cleared = 0
+    for mem_id in list(bot.user_words.keys()):
+        guild_words = bot.user_words[mem_id].pop(guild_id_str, None)
+        if guild_words is not None:
+            watchers_cleared += 1
+            words_cleared += len(guild_words)
+
+    had_counts = bot.swear_counts.pop(guild_id_str, None) is not None
+    had_board = guild_id_str in bot.leaderboards
+    forget_leaderboard(guild_id_str)
+
+    print("Removed from guild {} ({}). Purged {} watched word(s) across {} user(s); "
+          "swear counts: {}; leaderboard: {}.".format(
+              guild.name, guild_id_str, words_cleared, watchers_cleared,
+              "yes" if had_counts else "none", "yes" if had_board else "none"))
+    await save_data()
+
+
+# ---------------------------------------------------------------------------
+# Application command syncing
+#
+# Global tree.sync() is heavily rate-limited and there is no reason to call it on
+# a boot that changed nothing. Instead, hash everything Discord actually stores
+# about the command surface and sync only when that hash moves.
+#
+# Command.to_dict(tree) returns the exact payload sent to Discord - name,
+# description, every option's name/description/type/required/choices, plus
+# default_member_permissions and dm_permission - so ANY user-visible text change,
+# including a reworded docstring, moves the hash.
+# ---------------------------------------------------------------------------
+
+COMMAND_FINGERPRINT_VERSION = 1  # bump to force a one-off resync for everyone
+
+
+def compute_command_fingerprint() -> str:
+    """sha256 over the full global command surface. Stable across processes."""
+    entries = []
+    for command in bot.tree.get_commands():
+        try:
+            payload = command.to_dict(bot.tree)
+        except Exception:
+            # Fall back to the attributes we can read if the private shape changes.
+            payload = {"name": command.name,
+                       "description": getattr(command, "description", "")}
+        entries.append(payload)
+    # Registration order is not user-visible, so sort for a stable hash.
+    entries.sort(key=lambda d: (str(d.get("type", "")), str(d.get("name", ""))))
+    blob = json.dumps({"version": COMMAND_FINGERPRINT_VERSION, "commands": entries},
+                      sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def read_stored_command_fingerprint():
+    """Returns the fingerprint recorded by the last SUCCESSFUL sync, or None."""
+    state = load_json(SYNC_STATE_FILE, {})
+    fingerprint = state.get("fingerprint") if isinstance(state, dict) else None
+    return fingerprint if isinstance(fingerprint, str) and fingerprint else None
+
+
+def write_stored_command_fingerprint(fingerprint: str, command_count: int) -> None:
+    """Records a successful sync. Written atomically."""
+    state = {"version": COMMAND_FINGERPRINT_VERSION,
+             "fingerprint": fingerprint,
+             "command_count": command_count,
+             "synced_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+    tmp_path = SYNC_STATE_FILE + ".tmp"
     try:
-        # Sync globally on startup
-        await bot.tree.sync()
-        print("Commands synced globally.")
-    except Exception as e:
-        print(f"Error syncing commands globally on startup: {e}")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp_path, SYNC_STATE_FILE)
+    except OSError as e:
+        print("Could not write {}: {}. Commands will re-sync next boot.".format(SYNC_STATE_FILE, e))
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
-bot.setup_hook = custom_setup
-bot.run(token)
+
+async def sync_commands_if_changed() -> None:
+    """Syncs the global command tree only when its user-visible surface changed."""
+    current = compute_command_fingerprint()
+    stored = read_stored_command_fingerprint()
+
+    if FORCE_SYNC:
+        reason = "WORDWATCH_FORCE_SYNC is set"
+    elif stored is None:
+        reason = "no stored fingerprint"
+    elif stored != current:
+        reason = "fingerprint changed ({} -> {})".format(stored[:12], current[:12])
+    else:
+        print("Commands unchanged (fingerprint {}); skipping global sync.".format(current[:12]))
+        return
+
+    print("Syncing application commands globally: {}.".format(reason))
+    try:
+        synced = await bot.tree.sync()
+    except Exception as e:
+        # Deliberately do NOT store the fingerprint, so a rate-limited or failed
+        # sync retries next boot instead of being skipped forever.
+        print("Error syncing commands globally: {!r}. Will retry on next startup.".format(e))
+        return
+
+    write_stored_command_fingerprint(current, len(synced))
+    print("Synced {} application command(s). Fingerprint stored: {}.".format(
+        len(synced), current[:12]))
+
+
+# ---------------------------------------------------------------------------
+# Error handling
+#
+# How errors actually flow for a hybrid command (verified against discord.py
+# 2.7.1): the ext check predicates installed by commands.guild_only() and
+# commands.has_permissions() raise commands.NoPrivateMessage /
+# commands.MissingPermissions. On the slash path hybrid.py catches those with
+# `except CommandError` and hands them to command.dispatch_error(...), which
+# dispatches on_command_error and SWALLOWS the exception - bot.tree.error never
+# sees it. So on_command_error is the workhorse for BOTH paths, and tree.error
+# only catches what the ext layer never wraps (a stale registration, etc.).
+# ---------------------------------------------------------------------------
+
+ERROR_COLOR = 0xe23a1d
+
+
+def unwrap_command_error(error: BaseException) -> BaseException:
+    """Peels the wrapper layers discord.py puts around the real cause."""
+    for _ in range(5):
+        original = getattr(error, "original", None)
+        if original is None or original is error:
+            break
+        error = original
+    return error
+
+
+def explain_command_error(error: BaseException):
+    """Maps an error onto (user-facing message, whether to log a traceback)."""
+    app = discord.app_commands
+    err = unwrap_command_error(error)
+
+    if isinstance(err, (commands.NoPrivateMessage, app.NoPrivateMessage)):
+        return "This command can only be used inside a server.", False
+
+    if isinstance(err, (commands.MissingPermissions, app.MissingPermissions)):
+        missing = ", ".join(p.replace("_", " ").replace("guild", "server").title()
+                            for p in getattr(err, "missing_permissions", None) or [])
+        return ("You need the **{}** permission to use this command.".format(missing)
+                if missing else "You do not have permission to use this command."), False
+
+    if isinstance(err, (commands.BotMissingPermissions, app.BotMissingPermissions)):
+        missing = ", ".join(p.replace("_", " ").replace("guild", "server").title()
+                            for p in getattr(err, "missing_permissions", None) or [])
+        return ("I am missing the **{}** permission in this channel.".format(missing)
+                if missing else "I am missing a permission I need here."), False
+
+    # Must precede the generic CheckFailure branch: CommandOnCooldown subclasses it.
+    if isinstance(err, (commands.CommandOnCooldown, app.CommandOnCooldown)):
+        return "That command is on cooldown. Try again in {:.1f}s.".format(err.retry_after), False
+
+    if isinstance(err, commands.MissingRequiredArgument):
+        return "Missing required argument `{}`. Use `/help` for usage.".format(err.param.name), False
+
+    if isinstance(err, (commands.BadArgument, commands.BadUnionArgument,
+                        commands.TooManyArguments, commands.ArgumentParsingError)):
+        return "Bad argument: {}".format(err), False
+
+    if isinstance(err, app.TransformerError):
+        return "Could not interpret one of the options you supplied.", False
+
+    if isinstance(err, (app.CommandNotFound, app.CommandSignatureMismatch)):
+        return ("This command is out of date on Discord's side. It will be refreshed "
+                "the next time the bot restarts - please try again later."), True
+
+    if isinstance(err, commands.DisabledCommand):
+        return "That command is currently disabled.", False
+
+    # Any other failed check. Keep AFTER every specific CheckFailure subclass.
+    if isinstance(err, (commands.CheckFailure, app.CheckFailure)):
+        return "You can't use that command here.", False
+
+    return "Something went wrong while running that command.", True
+
+
+def build_error_embed(message: str) -> discord.Embed:
+    if len(message) <= 240:
+        return discord.Embed(title="❌ " + message, color=ERROR_COLOR)
+    return discord.Embed(title="❌ Command error",
+                         description=clamp(message, EMBED_DESCRIPTION_LIMIT), color=ERROR_COLOR)
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    """Handles the prefix path AND the slash path of every hybrid command.
+
+    Replaces commands.Bot.on_command_error, whose default behaviour is to print a
+    raw traceback to stderr and tell the user nothing.
+    """
+    # A stray mention that isn't a command: stay silent. The prefix is
+    # commands.when_mentioned, so every plain @WordWatch reaches this.
+    if isinstance(error, commands.CommandNotFound):
+        return
+    if ctx.command is not None and ctx.command.has_error_handler():
+        return
+    if ctx.cog is not None and ctx.cog.has_error_handler():
+        return
+
+    message, should_log = explain_command_error(error)
+    if should_log:
+        print("[on_command_error] {} raised {!r}".format(
+            getattr(ctx.command, "qualified_name", "<unknown command>"), error))
+        traceback.print_exception(type(error), error, error.__traceback__)
+
+    try:
+        await ctx.send(embed=build_error_embed(message), ephemeral=True)
+    except Exception as exc:
+        # Reporting an error must never become a second error.
+        print("[on_command_error] could not deliver error response: {!r}".format(exc))
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction,
+                               error: discord.app_commands.AppCommandError):
+    """Handles app-command failures the ext layer never sees."""
+    message, should_log = explain_command_error(error)
+    if should_log:
+        name = interaction.command.qualified_name if interaction.command else "<unknown command>"
+        print("[on_app_command_error] {} raised {!r}".format(name, error))
+        traceback.print_exception(type(error), error, error.__traceback__)
+
+    embed = build_error_embed(message)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception as exc:
+        print("[on_app_command_error] could not deliver error response: {!r}".format(exc))
+
+
+bot.run(DISCORD_TOKEN)
