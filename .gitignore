@@ -3,6 +3,7 @@
 
 # Local state files / databases
 *.json
+*.tmp
 !help_str.py
 
 # Python caching
