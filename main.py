@@ -217,7 +217,7 @@ async def deleteword(ctx, word: str = None):
     """Deletes specified word from the user's pinged words"""
     if word is None:
         embed = discord.Embed(
-            title="Use {prefix}help for command documentation.".format(prefix=bot.prefix), color=0x9f9f9f)
+            title="Use /help for command documentation.", color=0x9f9f9f)
         await ctx.send(embed=embed)
         return
 
@@ -265,7 +265,7 @@ async def watchword(ctx, word: str = None, *, channels: str = ""):
     """Adds word to user's watched list with timestamp. Optionally supports channel filtering."""
     if word is None:
         embed = discord.Embed(
-            title="Use {prefix}help for command documentation.".format(prefix=bot.prefix), color=0x9f9f9f)
+            title="Use /help for command documentation.", color=0x9f9f9f)
         await ctx.send(embed=embed)
         return
 
@@ -294,7 +294,7 @@ async def watchword(ctx, word: str = None, *, channels: str = ""):
     if len(args) == 0:
         embed = discord.Embed(title="\"{}\" added to watch list".format(word), color=0x39c12f)
         embed.set_footer(
-            text="Watching entire server. Use \"{}addfilter\" to only watch certain channels.".format(bot.prefix))
+            text="Watching entire server. Use /addfilter to only watch certain channels.")
     else:
         embed = discord.Embed(title="\"{}\" added to watch list".format(word), color=0x39c12f)
         channel_names = []
@@ -311,7 +311,7 @@ async def worddetail(ctx, word: str = None):
     """Gives user details for a watched word or phrase."""
     if word is None:
         embed = discord.Embed(
-            title="Use {prefix}help for command documentation.".format(prefix=bot.prefix), color=0x9f9f9f)
+            title="Use /help for command documentation.", color=0x9f9f9f)
         await ctx.send(embed=embed)
         return
 
@@ -352,7 +352,7 @@ async def addfilter(ctx, word: str = None, *, channels: str = ""):
     """Adds filter to specified word"""
     if word is None:
         embed = discord.Embed(
-            title="Use {prefix}help for command documentation.".format(prefix=bot.prefix), color=0x9f9f9f)
+            title="Use /help for command documentation.", color=0x9f9f9f)
         await ctx.send(embed=embed)
         return
 
@@ -397,7 +397,7 @@ async def deletefilter(ctx, word: str = None, *, channels: str = ""):
     """Removes filter from specified word"""
     if word is None:
         embed = discord.Embed(
-            title="Use {prefix}help for command documentation.".format(prefix=bot.prefix), color=0x9f9f9f)
+            title="Use /help for command documentation.", color=0x9f9f9f)
         await ctx.send(embed=embed)
         return
 
@@ -443,7 +443,7 @@ async def clearfilter(ctx, word: str = None):
     """Clears filter from specified word"""
     if word is None:
         embed = discord.Embed(
-            title="Use {prefix}help for command documentation.".format(prefix=bot.prefix), color=0x9f9f9f)
+            title="Use /help for command documentation.", color=0x9f9f9f)
         await ctx.send(embed=embed)
         return
 
