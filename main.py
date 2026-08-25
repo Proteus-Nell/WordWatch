@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import re
+import io
 
 import help_str
 
@@ -21,7 +22,6 @@ bot.remove_command('help')  # removes default help command!
 
 # Swear word tracking constants & regex
 def load_env(filepath=".env"):
-    import os
     if not os.path.exists(filepath):
         return
     with open(filepath, "r", encoding="utf-8") as f:
@@ -36,6 +36,8 @@ def load_env(filepath=".env"):
 
 load_env()
 token = os.getenv("DISCORD_TOKEN")
+if not token:
+    raise SystemExit("ERROR: DISCORD_TOKEN not set. Copy .env.example to .env and add your token.")
 
 def load_swear_words(filepath="swear_words.txt"):
     if not os.path.exists(filepath):
@@ -55,15 +57,16 @@ bot.swear_counts_file = "swearcounts.json"
 bot.leaderboards_file = "leaderboards.json"
 bot.thumb = "https://raw.githubusercontent.com/pixeltopic/WordWatch/master/alertimage.gif"
 bot.static = -1  # used for channel dict values to mimic a set
-bot.scan_frequency = 5  # number of seconds before bot looks at a message again
 bot.save_frequency = 900  # number of seconds before bot saves user data
+bot.swear_save_frequency = 30  # seconds between swear-triggered batch saves
 
 # Non-Constants
 bot.user_words = dict()
 bot.user_cds = dict()
 bot.swear_counts = dict()
 bot.leaderboards = dict()
-bot.last_checked = -1  # throttles event checking to prevent overload
+bot.swear_dirty = False  # tracks unsaved swear data
+bot.last_swear_save = 0  # timestamp of last swear-triggered save
 
 @bot.event
 async def on_ready():
@@ -210,12 +213,9 @@ def write_to_json():
     print("Saving user data @ {}".format(get_timeStamp()))
 
 @bot.hybrid_command()
+@commands.guild_only()
 async def cd(ctx, mins: float = 15.0):
     """Set cooldown (in minutes) for each word. If no parameter, automatically defaults to 15 minutes"""
-    if ctx.guild is None:
-        embed = discord.Embed(title="You can't use this command outside of servers.", color=0xe23a1d)
-        await ctx.send(embed=embed)
-        return
     check_user(ctx.author)
     if mins >= 0:
         bot.user_cds[str(ctx.author.id)] = int(mins)*60
@@ -225,15 +225,12 @@ async def cd(ctx, mins: float = 15.0):
     await ctx.send(embed=embed)
 
 @bot.hybrid_command()
+@commands.guild_only()
 async def deleteword(ctx, word: str = None):
     """Deletes specified word from the user's pinged words"""
     if word is None:
         embed = discord.Embed(
             title="Use {prefix}help for command documentation.".format(prefix=bot.prefix), color=0x9f9f9f)
-        await ctx.send(embed=embed)
-        return
-    if ctx.guild is None:
-        embed = discord.Embed(title="You can't use this command outside of servers.", color=0xe23a1d)
         await ctx.send(embed=embed)
         return
 
@@ -260,12 +257,9 @@ async def deleteword(ctx, word: str = None):
     await ctx.send(embed=embed)
 
 @bot.hybrid_command()
+@commands.guild_only()
 async def watchclear(ctx):
     """Clears all the user's watched words."""
-    if ctx.guild is None:
-        embed = discord.Embed(title="You can't use this command outside of servers.", color=0xe23a1d)
-        await ctx.send(embed=embed)
-        return
 
     member = ctx.author
     server_id = str(ctx.guild.id)
@@ -279,15 +273,12 @@ async def watchclear(ctx):
     await ctx.send(embed=embed)
 
 @bot.hybrid_command()
+@commands.guild_only()
 async def watchword(ctx, word: str = None, *, channels: str = ""):
     """Adds word to user's watched list with timestamp. Optionally supports channel filtering."""
     if word is None:
         embed = discord.Embed(
             title="Use {prefix}help for command documentation.".format(prefix=bot.prefix), color=0x9f9f9f)
-        await ctx.send(embed=embed)
-        return
-    if ctx.guild is None:
-        embed = discord.Embed(title="You can't use this command outside of servers.", color=0xe23a1d)
         await ctx.send(embed=embed)
         return
 
@@ -328,15 +319,12 @@ async def watchword(ctx, word: str = None, *, channels: str = ""):
     await ctx.send(embed=embed)
 
 @bot.hybrid_command()
+@commands.guild_only()
 async def worddetail(ctx, word: str = None):
     """Gives user details for a watched word or phrase."""
     if word is None:
         embed = discord.Embed(
             title="Use {prefix}help for command documentation.".format(prefix=bot.prefix), color=0x9f9f9f)
-        await ctx.send(embed=embed)
-        return
-    if ctx.guild is None:
-        embed = discord.Embed(title="You can't use this command outside of servers.", color=0xe23a1d)
         await ctx.send(embed=embed)
         return
 
@@ -372,15 +360,12 @@ async def worddetail(ctx, word: str = None):
     await ctx.send(embed=embed)
 
 @bot.hybrid_command()
+@commands.guild_only()
 async def addfilter(ctx, word: str = None, *, channels: str = ""):
     """Adds filter to specified word"""
     if word is None:
         embed = discord.Embed(
             title="Use {prefix}help for command documentation.".format(prefix=bot.prefix), color=0x9f9f9f)
-        await ctx.send(embed=embed)
-        return
-    if ctx.guild is None:
-        embed = discord.Embed(title="You can't use this command outside of servers.", color=0xe23a1d)
         await ctx.send(embed=embed)
         return
 
@@ -420,15 +405,12 @@ async def addfilter(ctx, word: str = None, *, channels: str = ""):
     await ctx.send(embed=embed)
 
 @bot.hybrid_command()
+@commands.guild_only()
 async def deletefilter(ctx, word: str = None, *, channels: str = ""):
     """Removes filter from specified word"""
     if word is None:
         embed = discord.Embed(
             title="Use {prefix}help for command documentation.".format(prefix=bot.prefix), color=0x9f9f9f)
-        await ctx.send(embed=embed)
-        return
-    if ctx.guild is None:
-        embed = discord.Embed(title="You can't use this command outside of servers.", color=0xe23a1d)
         await ctx.send(embed=embed)
         return
 
@@ -469,15 +451,12 @@ async def deletefilter(ctx, word: str = None, *, channels: str = ""):
     await ctx.send(embed=embed)
 
 @bot.hybrid_command()
+@commands.guild_only()
 async def clearfilter(ctx, word: str = None):
     """Clears filter from specified word"""
     if word is None:
         embed = discord.Embed(
             title="Use {prefix}help for command documentation.".format(prefix=bot.prefix), color=0x9f9f9f)
-        await ctx.send(embed=embed)
-        return
-    if ctx.guild is None:
-        embed = discord.Embed(title="You can't use this command outside of servers.", color=0xe23a1d)
         await ctx.send(embed=embed)
         return
 
@@ -499,13 +478,9 @@ async def clearfilter(ctx, word: str = None):
     await ctx.send(embed=embed)
 
 @bot.hybrid_command()
+@commands.guild_only()
 async def watched(ctx):
     """Shows user a list of their watched words"""
-    if ctx.guild is None:
-        embed = discord.Embed(
-            title="You can't use this command outside of servers.", color=0xe23a1d)
-        await ctx.send(embed=embed)
-        return
     member = ctx.author
     server_id = str(ctx.guild.id)
 
@@ -571,12 +546,9 @@ async def make_swearboard_embed(guild: discord.Guild) -> discord.Embed:
     return embed
 
 @bot.hybrid_command()
+@commands.guild_only()
 async def swearboard(ctx):
     """Outputs a live-updating table of the top swearers in the server."""
-    if ctx.guild is None:
-        embed = discord.Embed(title="You can't use this command outside of servers.", color=0xe23a1d)
-        await ctx.send(embed=embed)
-        return
 
     embed = await make_swearboard_embed(ctx.guild)
     msg = await ctx.send(embed=embed)
@@ -588,6 +560,103 @@ async def swearboard(ctx):
         "message_id": str(msg.id)
     }
     write_to_json()
+
+@bot.hybrid_command()
+@commands.guild_only()
+@commands.has_permissions(administrator=True)
+async def swearreset(ctx):
+    """Resets the swear leaderboard for the current server. Admin only."""
+    guild_id_str = str(ctx.guild.id)
+    bot.swear_counts.pop(guild_id_str, None)
+    # Also remove the leaderboard message reference
+    bot.leaderboards.pop(guild_id_str, None)
+    write_to_json()
+    embed = discord.Embed(title="🗑️ Swear leaderboard has been reset.", color=0x39c12f)
+    await ctx.send(embed=embed)
+
+@bot.hybrid_command()
+@commands.guild_only()
+@commands.has_permissions(administrator=True)
+async def swearexport(ctx):
+    """Exports the server's swear leaderboard as a JSON file. Admin only."""
+    guild_id_str = str(ctx.guild.id)
+    server_data = bot.swear_counts.get(guild_id_str, {})
+
+    export_data = {
+        "guild_id": guild_id_str,
+        "guild_name": ctx.guild.name,
+        "exported_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "swear_counts": server_data
+    }
+
+    json_str = json.dumps(export_data, indent=2)
+    file = discord.File(io.BytesIO(json_str.encode("utf-8")), filename=f"swearboard_{guild_id_str}.json")
+    embed = discord.Embed(title="📤 Swear leaderboard exported.", color=0x39c12f)
+    await ctx.send(embed=embed, file=file)
+
+@bot.hybrid_command()
+@commands.guild_only()
+@commands.has_permissions(administrator=True)
+async def swearimport(ctx, file: discord.Attachment = None):
+    """Imports swear leaderboard data from an attached JSON file. Admin only."""
+    if file is None:
+        embed = discord.Embed(title="❌ Please attach a JSON file to import.", color=0xe23a1d)
+        await ctx.send(embed=embed)
+        return
+
+    if not file.filename.endswith(".json"):
+        embed = discord.Embed(title="❌ File must be a .json file.", color=0xe23a1d)
+        await ctx.send(embed=embed)
+        return
+
+    if file.size > 1_000_000:  # 1MB limit
+        embed = discord.Embed(title="❌ File too large (max 1MB).", color=0xe23a1d)
+        await ctx.send(embed=embed)
+        return
+
+    try:
+        raw = await file.read()
+        data = json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        embed = discord.Embed(title="❌ Invalid JSON file.", color=0xe23a1d)
+        await ctx.send(embed=embed)
+        return
+
+    # Validate structure
+    if not isinstance(data, dict) or "swear_counts" not in data:
+        embed = discord.Embed(title="❌ Invalid format: missing 'swear_counts' key.", color=0xe23a1d)
+        await ctx.send(embed=embed)
+        return
+
+    swear_counts = data["swear_counts"]
+    if not isinstance(swear_counts, dict):
+        embed = discord.Embed(title="❌ Invalid format: 'swear_counts' must be an object.", color=0xe23a1d)
+        await ctx.send(embed=embed)
+        return
+
+    # Validate all values are non-negative integers
+    for user_id, count in swear_counts.items():
+        if not isinstance(user_id, str) or not user_id.isdigit():
+            embed = discord.Embed(title=f"❌ Invalid user ID: '{user_id}'. Must be a numeric string.", color=0xe23a1d)
+            await ctx.send(embed=embed)
+            return
+        if not isinstance(count, int) or count < 0:
+            embed = discord.Embed(title=f"❌ Invalid count for user '{user_id}': must be a non-negative integer.", color=0xe23a1d)
+            await ctx.send(embed=embed)
+            return
+
+    guild_id_str = str(ctx.guild.id)
+    bot.swear_counts[guild_id_str] = swear_counts
+    write_to_json()
+
+    total_users = len(swear_counts)
+    total_swears = sum(swear_counts.values())
+    embed = discord.Embed(
+        title="📥 Swear leaderboard imported.",
+        description=f"Loaded **{total_users}** users with **{total_swears}** total swears.",
+        color=0x39c12f
+    )
+    await ctx.send(embed=embed)
 
 @bot.event
 async def on_message(message):
@@ -609,9 +678,15 @@ async def on_message(message):
                     bot.swear_counts[guild_id_str] = {}
                 if author_id_str not in bot.swear_counts[guild_id_str]:
                     bot.swear_counts[guild_id_str][author_id_str] = 0
-                
+
                 bot.swear_counts[guild_id_str][author_id_str] += len(matches)
-                write_to_json()
+                bot.swear_dirty = True
+
+                # Debounced save: only write to disk every swear_save_frequency seconds
+                if current_time - bot.last_swear_save >= bot.swear_save_frequency:
+                    write_to_json()
+                    bot.swear_dirty = False
+                    bot.last_swear_save = current_time
 
                 # Trigger leaderboard update
                 if guild_id_str in bot.leaderboards:
@@ -635,26 +710,22 @@ async def on_message(message):
                         print(f"Error updating leaderboard: {e}")
 
         # 2. Key words scanning & alerts
-        if (bot.last_checked == -1 or current_time - bot.last_checked >= bot.scan_frequency) and \
-                message.content[:2] != bot.prefix:
-            bot.last_checked = current_time
-
+        if message.content[:2] != bot.prefix:
             for mem in list(bot.user_words.keys()):
                 if guild_id_str in bot.user_words[mem]:
                     for keyword, innerdict in list(bot.user_words[mem][guild_id_str].items()):
                         # Make sure we don't alert if the author is the watcher themselves
                         if author_id_str == mem:
                             continue
-                        
+
                         is_detected = keyword in message.content.lower()
                         cooldown_expired = current_time - innerdict["last_alerted"] >= bot.user_cds.get(mem, 15*60)
-                        not_command = message.content[:2] != bot.prefix
 
-                        if is_detected and cooldown_expired and not_command:
+                        if is_detected and cooldown_expired:
                             has_no_filters = len(innerdict["channels"]) == 0
                             has_channel_filter = ("<#"+str(message.channel.id)+">" in innerdict["channels"]) or \
                                                  ("<!#"+str(message.channel.id)+">" in innerdict["channels"])
-                            
+
                             if has_no_filters or has_channel_filter:
                                 bot.user_words[mem][guild_id_str][keyword]["last_alerted"] = current_time
                                 try:
@@ -666,6 +737,7 @@ async def on_message(message):
                                         embed.add_field(name="Channel", value=message.channel.name, inline=False)
                                         embed.add_field(name="Author", value=str(message.author), inline=False)
                                         embed.add_field(name="Content", value=message.content, inline=False)
+                                        embed.add_field(name="Jump", value=f"[Go to message]({message.jump_url})", inline=False)
                                         embed.set_footer(text="Detected message sent at {}".format(message.created_at))
                                         await user.send(embed=embed)
                                 except Exception as e:
@@ -679,22 +751,13 @@ async def save_json():
     while not bot.is_closed():
         await asyncio.sleep(bot.save_frequency)  # task runs every 900 seconds (15 mins)
         write_to_json()
+        bot.swear_dirty = False
 
 @bot.hybrid_command()
+@commands.guild_only()
+@commands.has_permissions(administrator=True)
 async def forcesave(ctx):
     """Forces the bot to write current saved user data into their respective JSON files."""
-    if ctx.guild is None:
-        embed = discord.Embed(
-            title="You can't use this command outside of servers.", color=0xe23a1d)
-        await ctx.send(embed=embed)
-        return
-
-    perms = ctx.author.guild_permissions
-
-    if not perms.administrator:
-        embed = discord.Embed(title="Command only usable by admin", color=0xe23a1d)
-        await ctx.send(embed=embed)
-        return
 
     write_to_json()
 
@@ -702,20 +765,10 @@ async def forcesave(ctx):
     await ctx.send(embed=embed)
 
 @bot.hybrid_command()
+@commands.guild_only()
+@commands.has_permissions(administrator=True)
 async def botstop(ctx):
     """Turns off the bot"""
-    if ctx.guild is None:
-        embed = discord.Embed(
-            title="You can't use this command outside of servers.", color=0xe23a1d)
-        await ctx.send(embed=embed)
-        return
-
-    perms = ctx.author.guild_permissions
-
-    if not perms.administrator:
-        embed = discord.Embed(title="Command only usable by admin", color=0xe23a1d)
-        await ctx.send(embed=embed)
-        return
 
     embed = discord.Embed(title="WordWatch Bot saving data and logging out.", color=0xe23a1d)
     await ctx.send(embed=embed)
@@ -726,10 +779,25 @@ async def botstop(ctx):
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: discord.app_commands.AppCommandError):
+    msg = f"❌ An error occurred: {error}"
+    if isinstance(error, discord.app_commands.errors.CommandInvokeError) and isinstance(error.original, commands.NoPrivateMessage):
+        msg = "❌ This command can only be used in servers."
     if interaction.response.is_done():
-        await interaction.followup.send(f"❌ An error occurred: {error}", ephemeral=True)
+        await interaction.followup.send(msg, ephemeral=True)
     else:
-        await interaction.response.send_message(f"❌ An error occurred: {error}", ephemeral=True)
+        await interaction.response.send_message(msg, ephemeral=True)
+
+@bot.event
+async def on_command_error(ctx, error):
+    """Handles errors for prefix commands."""
+    if isinstance(error, commands.NoPrivateMessage):
+        embed = discord.Embed(title="You can't use this command outside of servers.", color=0xe23a1d)
+        await ctx.send(embed=embed)
+    elif isinstance(error, commands.MissingPermissions):
+        embed = discord.Embed(title="Command only usable by admin", color=0xe23a1d)
+        await ctx.send(embed=embed)
+    else:
+        raise error
 
 async def custom_setup():
     bot.loop.create_task(save_json())
