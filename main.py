@@ -6,6 +6,7 @@ import datetime
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import io
@@ -105,8 +106,10 @@ def _env_float(name: str, default: float, minimum: float | None = None, maximum:
     except ValueError:
         print("WARNING: {}={!r} is not a number; using default {}.".format(name, raw, default))
         return default
-    if value != value:  # NaN compares false against everything, including itself
-        print("WARNING: {}={!r} is not a number; using default {}.".format(name, raw, default))
+    if not math.isfinite(value):
+        # Catches NaN and +/-inf. int(inf * 60) raises OverflowError, which would
+        # kill the boot -- exactly what these readers exist to prevent.
+        print("WARNING: {}={!r} is not a finite number; using default {}.".format(name, raw, default))
         return default
     if minimum is not None and value < minimum:
         print("WARNING: {}={} is below the minimum of {}; using {}.".format(name, value, minimum, minimum))
@@ -206,6 +209,19 @@ class WordWatchBot(commands.Bot):
         # this the periodic save task can be garbage collected mid-flight.
         self._save_task = None
 
+    async def close(self) -> None:
+        """Flushes unsaved state before disconnecting.
+
+        Without this, anything changed since the last periodic save is lost on
+        SIGTERM/Ctrl-C, because save_json's sleep is simply cancelled.
+        """
+        try:
+            if bot.swear_dirty or bot.data_dirty:
+                await save_data()
+        except Exception as e:
+            print("Could not save during shutdown: {!r}".format(e))
+        await super().close()
+
     async def setup_hook(self) -> None:
         load_data()
         if self._save_task is None or self._save_task.done():
@@ -253,6 +269,7 @@ bot.user_cds = dict()
 bot.swear_counts = dict()
 bot.leaderboards = dict()
 bot.swear_dirty = False               # True when swear_counts holds unsaved changes
+bot.data_dirty = False                # True when words/cooldowns hold unsaved changes
 bot.last_swear_save = 0               # epoch seconds of the last successful save
 bot.last_leaderboard_update = dict()  # guild_id -> epoch seconds of last board edit
 bot.leaderboard_pending = set()       # guild_ids whose board needs a redraw
@@ -269,8 +286,6 @@ bot.alert_content_max_chars = ALERT_CONTENT_MAX_CHARS
 bot.watched_page_size = WATCHED_PAGE_SIZE
 bot.max_import_bytes = MAX_IMPORT_BYTES
 bot.leaderboard_update_frequency = LEADERBOARD_UPDATE_FREQUENCY
-bot.save_frequency = SAVE_FREQUENCY
-bot.swear_save_frequency = SWEAR_SAVE_FREQUENCY
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +313,19 @@ bot.swear_save_frequency = SWEAR_SAVE_FREQUENCY
 
 _WORD_RUN = re.compile(r'\w+', re.UNICODE)
 
+# re.IGNORECASE folds two characters onto ASCII that str.casefold() does not.
+# Derived by scanning the whole of Unicode (U+0000-U+10FFFF) for characters where
+# re.fullmatch(ascii_char, ch, re.IGNORECASE) succeeds but casefold() does not
+# produce that character; the result is exactly these two. Without them the token
+# prefilter is stricter than the pattern it guards and silently drops real
+# matches ("b\u0131tch", "sh\u0130t"). test asserts the set is still complete.
+_IGNORECASE_FOLD = str.maketrans({"\u0130": "i", "\u0131": "i"})
+
+
+def _fold(text: str) -> str:
+    """Folds text at least as aggressively as re.IGNORECASE does."""
+    return text.translate(_IGNORECASE_FOLD).casefold()
+
 
 def _prefilter_key(entry: str):
     """The most selective \\w+ run of an entry, or None if it has none.
@@ -312,12 +340,17 @@ def _prefilter_key(entry: str):
     common words like "a" (from the entry "a s s") out of the prefilter.
 
     Entries with no word characters at all (e.g. "@$$") get no key and are always
-    tested, since "b@$$y" is a legitimate match.
+    tested, since "b@$$y" is a legitimate match. Keys and message tokens are both
+    folded via _fold() so the prefilter folds at least as hard as re.IGNORECASE.
     """
     runs = _WORD_RUN.findall(entry)
     if not runs:
         return None
-    return max(runs, key=lambda r: (len(r), r)).lower()
+    # casefold(), not lower(): re.IGNORECASE folds characters lower() leaves
+    # alone (U+017F LATIN SMALL LETTER LONG S folds to "s", U+0131 DOTLESS I and
+    # U+0130 I WITH DOT ABOVE fold to "i"). Keying the prefilter on lower() while
+    # matching with IGNORECASE let "\u017fhit" slip past the counter entirely.
+    return _fold(max(runs, key=lambda r: (len(r), r)))
 
 
 def _build_swear_matcher(words):
@@ -355,7 +388,7 @@ def count_swears(content: str) -> int:
     # Prefilter: an entry can only match if its most selective token appears as
     # a token of the message. Tokenising is linear and cheap; the full
     # alternation is not. Ordinary chatter exits here.
-    tokens = {m.group(0).lower() for m in _WORD_RUN.finditer(content)}
+    tokens = {_fold(m.group(0)) for m in _WORD_RUN.finditer(content)}
     if tokens.isdisjoint(SWEAR_FIRST_TOKENS):
         if SWEAR_ALWAYS_PATTERN is None:
             return 0
@@ -572,8 +605,15 @@ def ensure_valid_channels(member: discord.Member, server: discord.Guild, word: s
     # Threads are not in guild.channels, so include them or a thread filter would
     # be silently deleted the first time /worddetail runs.
     all_channels = {x.id for x in server.channels} | {x.id for x in server.threads}
-    entry["channels"] = {cid: bot.static for cid in entry["channels"]
-                         if get_channel_id(cid) in all_channels}
+    kept = {cid: bot.static for cid in entry["channels"]
+            if get_channel_id(cid) in all_channels}
+    # Never prune a filter down to empty: on_message reads an empty channel dict
+    # as "watch the whole server", so dropping the last entry would silently turn
+    # a deliberately narrow watch into a server-wide DM firehose. guild.threads is
+    # only the ACTIVE thread cache, so an archived thread would otherwise be
+    # pruned here too. Leaving a dead filter in place simply matches nothing.
+    if kept or not entry["channels"]:
+        entry["channels"] = kept
 
 
 # Serializes saves so a periodic autosave and a swear-triggered save can never
@@ -660,34 +700,49 @@ def write_to_json() -> bool:
     return True
 
 
+async def _save_locked() -> bool:
+    """Performs the write. The caller must already hold _save_lock."""
+    ok = await asyncio.to_thread(write_to_json)
+    if ok:
+        bot.swear_dirty = False
+        bot.data_dirty = False
+        bot.last_swear_save = calendar.timegm(time.gmtime())
+    return ok
+
+
 async def save_data() -> bool:
     """Saves all bot data without blocking the event loop.
 
-    write_to_json() does blocking file I/O, so it runs in a worker thread. On
-    success the swear bookkeeping is cleared here, in one place, so that every
-    save path - periodic, debounced, or command-triggered - leaves
-    `swear_dirty` and `last_swear_save` consistent.
+    write_to_json() does blocking file I/O, so it runs in a worker thread. The
+    bookkeeping is cleared in one place so that every save path - periodic,
+    debounced, or command-triggered - leaves the dirty flags consistent.
     """
     async with _save_lock:
-        ok = await asyncio.to_thread(write_to_json)
-        if ok:
-            bot.swear_dirty = False
-            bot.last_swear_save = calendar.timegm(time.gmtime())
-        return ok
+        return await _save_locked()
+
+
+def _swear_save_due() -> bool:
+    return (bot.swear_dirty and
+            calendar.timegm(time.gmtime()) - bot.last_swear_save >= SWEAR_SAVE_FREQUENCY)
 
 
 async def maybe_save_swears() -> bool:
     """Debounced save for swear counts.
 
-    Writes only when there is something new to write (`swear_dirty`) and at most
-    once every SWEAR_SAVE_FREQUENCY seconds. Cheap enough to call on every
-    message.
+    Writes only when there is something new to write and at most once every
+    SWEAR_SAVE_FREQUENCY seconds. Cheap enough to call on every message.
+
+    The condition is checked twice: once cheaply before contending for the lock,
+    and again after acquiring it. Without the second check, every message that
+    arrives while an earlier save is in flight would queue its own full four-file
+    write, since the flags are only cleared once that write completes.
     """
-    if not bot.swear_dirty:
+    if not _swear_save_due():
         return False
-    if calendar.timegm(time.gmtime()) - bot.last_swear_save < SWEAR_SAVE_FREQUENCY:
-        return False
-    return await save_data()
+    async with _save_lock:
+        if not _swear_save_due():
+            return False
+        return await _save_locked()
 
 
 async def save_json():
@@ -695,10 +750,6 @@ async def save_json():
     await bot.wait_until_ready()
     while not bot.is_closed():
         await asyncio.sleep(SAVE_FREQUENCY)
-        # Unconditional: watched words, filters and cooldowns are only ever
-        # persisted here, so this cannot be gated on swear_dirty. save_data()
-        # resets the swear bookkeeping, which stops the next swear from
-        # triggering a redundant write seconds after this one.
         await save_data()
 
 
@@ -735,7 +786,15 @@ def forget_leaderboard(guild_id: str) -> None:
 
 
 async def _resolve_leaderboard_message(guild_id: str):
-    """Returns the board's Message, using a cached handle when we have one."""
+    """Returns the board's Message, using a cached channel-bound handle if we have one.
+
+    Only messages obtained via channel.fetch_message are ever cached. The object
+    Context.send returns on the slash-command path is an InteractionMessage whose
+    edit() routes through edit_original_response, i.e. the interaction webhook
+    token - and that token expires 15 minutes after the interaction. Caching it
+    meant every redraw after that window got a 404, which _redraw_leaderboard
+    classified as permanent and used to unregister the board.
+    """
     cached = bot.leaderboard_messages.get(guild_id)
     if cached is not None:
         return cached
@@ -755,12 +814,16 @@ async def _redraw_leaderboard(guild: discord.Guild) -> None:
     guild_id = str(guild.id)
     if guild_id not in bot.leaderboards:
         return
+    # Stamped before the attempt, not after a success. If this were only updated
+    # on success, one transient failure would leave `elapsed` unbounded and the
+    # next swear would redraw immediately with no debounce at all - amplifying
+    # the 429 storm the coalescing exists to prevent.
+    bot.last_leaderboard_update[guild_id] = calendar.timegm(time.gmtime())
     try:
         message = await _resolve_leaderboard_message(guild_id)
         if message is None:
             return
         await message.edit(embed=await make_swearboard_embed(guild))
-        bot.last_leaderboard_update[guild_id] = calendar.timegm(time.gmtime())
     except (discord.NotFound, discord.Forbidden) as e:
         # Permanent: the message is gone, or we can no longer edit it. Clean up
         # rather than retrying forever.
@@ -825,8 +888,11 @@ async def make_swearboard_embed(guild: discord.Guild) -> discord.Embed:
         user_name = member.name if member is not None else "Unknown User"
         if len(user_name) > 20:
             user_name = user_name[:17] + "..."
-        table_lines.append("| {:<4} | {:<20} | {:<5} |".format(
-            rank, user_name, as_int(count, 0)))
+        # Abbreviated so a large count cannot widen the column and break the
+        # table's alignment against the +---+ rules above and below.
+        n = as_int(count, 0)
+        shown = str(n) if n < 100000 else ("{}k".format(n // 1000) if n < 100000000 else "99999k")
+        table_lines.append("| {:<4} | {:<20} | {:<5} |".format(rank, user_name, shown[:5]))
 
     if not sorted_users:
         table_lines.append("| -    | No users yet         | -     |")
@@ -889,11 +955,15 @@ async def cd(ctx, mins: float = None):
     check_user(ctx.author)
     if mins is None:
         mins = float(bot.default_cooldown_minutes)
-    if mins < 0:
-        embed = discord.Embed(title="Minute cooldown cannot be negative.", color=0xe23a1d)
+    if not math.isfinite(mins) or mins < 0:
+        embed = discord.Embed(title="Minute cooldown must be a non-negative number.", color=0xe23a1d)
     else:
-        bot.user_cds[str(ctx.author.id)] = int(mins) * 60
-        embed = discord.Embed(title="Notification cooldown set to {} min".format(int(mins)),
+        # int(mins * 60), not int(mins) * 60: the latter truncated a fractional
+        # setting (0.5 minutes) to a zero-second cooldown, i.e. no rate limiting.
+        bot.user_cds[str(ctx.author.id)] = int(mins * 60)
+        bot.data_dirty = True
+        await save_data()
+        embed = discord.Embed(title="Notification cooldown set to {:g} min".format(mins),
                               color=0x39c12f)
     await ctx.send(embed=embed)
 
@@ -918,6 +988,8 @@ async def deleteword(ctx, word: str = None):
     stored_key = find_watched_word(words, word)
     if stored_key is not None:
         words.pop(stored_key, None)
+        bot.data_dirty = True
+        await save_data()
         await ctx.send(embed=discord.Embed(
             title=clamp("\"{}\" deleted from watch list".format(stored_key), EMBED_TITLE_LIMIT),
             color=0x39c12f))
@@ -935,6 +1007,8 @@ async def watchclear(ctx):
     check_user(ctx.author)
     check_server(ctx.author, str(ctx.guild.id))
     bot.user_words[str(ctx.author.id)][str(ctx.guild.id)] = dict()
+    bot.data_dirty = True
+    await save_data()
     await ctx.send(embed=discord.Embed(title="Your watch list is cleared.", color=0x39c12f))
 
 
@@ -976,6 +1050,8 @@ async def watchword(ctx, word: str = None, *, channels: str = ""):
 
     words[word] = {"last_alerted": calendar.timegm(time.gmtime()),
                    "channels": {x: bot.static for x in args}}
+    bot.data_dirty = True
+    await save_data()
 
     embed = discord.Embed(
         title=clamp("\"{}\" added to watch list".format(word), EMBED_TITLE_LIMIT), color=0x39c12f)
@@ -1050,6 +1126,8 @@ async def addfilter(ctx, word: str = None, *, channels: str = ""):
         return
 
     get_word_entry(words, stored_key)["channels"].update({x: bot.static for x in args})
+    bot.data_dirty = True
+    await save_data()
     await ctx.send(embed=discord.Embed(
         title=clamp("{} added to \"{}\"".format(format_channel_names(args), stored_key), EMBED_TITLE_LIMIT),
         color=0x39c12f))
@@ -1082,6 +1160,8 @@ async def deletefilter(ctx, word: str = None, *, channels: str = ""):
     entry = get_word_entry(words, stored_key)
     for to_remove in args:
         entry["channels"].pop(to_remove, None)
+    bot.data_dirty = True
+    await save_data()
     await ctx.send(embed=discord.Embed(
         title=clamp("{} removed from \"{}\"".format(format_channel_names(args), stored_key), EMBED_TITLE_LIMIT),
         color=0x39c12f))
@@ -1104,6 +1184,8 @@ async def clearfilter(ctx, word: str = None):
         return
 
     get_word_entry(words, stored_key)["channels"] = dict()
+    bot.data_dirty = True
+    await save_data()
     embed = discord.Embed(
         title=clamp("All filters removed from \"{}\"".format(stored_key), EMBED_TITLE_LIMIT),
         color=0x39c12f)
@@ -1188,7 +1270,11 @@ async def swearboard(ctx):
     guild_id_str = str(ctx.guild.id)
     bot.leaderboards[guild_id_str] = {"channel_id": str(ctx.channel.id),
                                       "message_id": str(msg.id)}
-    bot.leaderboard_messages[guild_id_str] = msg
+    # Store ids only. msg may be an InteractionMessage bound to an interaction
+    # token that expires in 15 minutes; _resolve_leaderboard_message will fetch a
+    # durable channel-bound handle on the first redraw. Drop any stale handle from
+    # a previous board in this guild.
+    bot.leaderboard_messages.pop(guild_id_str, None)
     bot.last_leaderboard_update[guild_id_str] = calendar.timegm(time.gmtime())
     await save_data()
 
@@ -1407,7 +1493,11 @@ async def on_message(message):
             if not isinstance(keyword, str) or not keyword.strip():
                 continue  # a legacy empty key would match every single message
             if not isinstance(innerdict, dict):
-                innerdict = {}
+                # Repair the STORED value, not just a local shadow. Shadowing left
+                # commit_last_alerted unable to write (it checks the stored entry),
+                # so the cooldown never recorded and the watcher was DMed for every
+                # matching message forever.
+                innerdict = get_word_entry(server_words, keyword)
 
             if keyword not in lowered_content:
                 continue
@@ -1426,6 +1516,15 @@ async def on_message(message):
                 continue
 
             try:
+                # Reserve the cooldown BEFORE the first await. discord.py runs each
+                # on_message as its own task, so a burst of matching messages would
+                # otherwise all read the same stale timestamp while the first is
+                # parked on the DM and each send their own alert. Reserving here
+                # (still inside the try) closes that window; a transient failure
+                # rolls the value back below so the next message retries.
+                previous_alerted = last_alerted
+                commit_last_alerted(mem, guild_id_str, keyword, current_time)
+
                 # Cache first: fetch_user is a full HTTP round trip, once per alert,
                 # and the watcher is normally already cached.
                 user = bot.get_user(int(mem))
@@ -1433,16 +1532,16 @@ async def on_message(message):
                     user = await bot.fetch_user(int(mem))
                 if user:
                     await user.send(embed=build_alert_embed(message))
-                    # Cooldown is spent only once the DM actually landed.
-                    commit_last_alerted(mem, guild_id_str, keyword, current_time)
+                else:
+                    commit_last_alerted(mem, guild_id_str, keyword, previous_alerted)
             except discord.Forbidden:
-                # DMs closed or bot blocked: this can never succeed, so spend the
-                # cooldown anyway rather than taking a 403 on every matching message.
-                commit_last_alerted(mem, guild_id_str, keyword, current_time)
+                # DMs closed or bot blocked: this can never succeed, so keep the
+                # reservation rather than taking a 403 on every matching message.
                 print("Cannot DM user {}: DMs closed or bot blocked.".format(mem))
             except Exception as e:
-                # Transient failure: leave last_alerted alone so the next matching
+                # Transient failure: put the cooldown back so the next matching
                 # message retries instead of silently skipping.
+                commit_last_alerted(mem, guild_id_str, keyword, previous_alerted)
                 print("Error alerting user {}: {}".format(mem, e))
 
 
@@ -1467,9 +1566,42 @@ def load_data():
     for mem_id in bot.user_words:
         bot.user_cds.setdefault(mem_id, DEFAULT_COOLDOWN_SECONDS)
 
+    migrated = migrate_quoted_words()
+
     bot._data_loaded = True
-    print("Data loaded: {} user(s), {} guild(s) with swear counts, {} leaderboard(s).".format(
-        len(bot.user_words), len(bot.swear_counts), len(bot.leaderboards)))
+    print("Data loaded: {} user(s), {} guild(s) with swear counts, {} leaderboard(s).{}".format(
+        len(bot.user_words), len(bot.swear_counts), len(bot.leaderboards),
+        " Normalized {} quoted word(s).".format(migrated) if migrated else ""))
+
+
+def migrate_quoted_words() -> int:
+    """Rewrites words stored with literal quote characters to their bare form.
+
+    Before quote-stripping existed the slash-command path stored the option
+    verbatim, so /watchword "lorem ipsum" saved the key '"lorem ipsum"'. Commands
+    can still find those via word_lookup_keys, but on_message matches the stored
+    key against the message text directly - so such an entry is listed by
+    /watched and looks active while never firing an alert. Normalizing once on
+    load fixes them for good; on a collision the bare key wins and the quoted
+    duplicate is dropped.
+    """
+    migrated = 0
+    for guilds in bot.user_words.values():
+        if not isinstance(guilds, dict):
+            continue
+        for words in guilds.values():
+            if not isinstance(words, dict):
+                continue
+            for key in list(words.keys()):
+                if not isinstance(key, str):
+                    continue
+                fixed = normalize_word(key).lower()
+                if not fixed or fixed == key:
+                    continue
+                entry = words.pop(key)
+                words.setdefault(fixed, entry)
+                migrated += 1
+    return migrated
 
 
 @bot.event
@@ -1496,7 +1628,10 @@ async def on_guild_remove(guild: discord.Guild):
 
     watchers_cleared = words_cleared = 0
     for mem_id in list(bot.user_words.keys()):
-        guild_words = bot.user_words[mem_id].pop(guild_id_str, None)
+        guilds = bot.user_words.get(mem_id)
+        if not isinstance(guilds, dict):
+            continue  # malformed persisted entry; nothing to purge here
+        guild_words = guilds.pop(guild_id_str, None)
         if guild_words is not None:
             watchers_cleared += 1
             words_cleared += len(guild_words)
