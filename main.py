@@ -911,10 +911,18 @@ async def help(ctx):
     """Shows the bot documentation in this channel"""
     # Posted in-channel, not by DM: ctx.author.send() raises discord.Forbidden for
     # anyone with DMs closed, which made /help fail outright for those users.
+    # Branding card, carried over from upstream. Kept as its own embed so the
+    # original author's attribution survives; /help no longer DMs, so all three
+    # go out together in the channel.
+    banner = discord.Embed(title="WordWatch Bot",
+                           description="Checks messages for key words and notifies you!",
+                           color=0x30abc0)
+    banner.set_thumbnail(url=bot.thumb)
+    banner.set_footer(text="by pixeltopic")
+
     core = discord.Embed(title="WordWatch Bot Commands",
                          description=help_str.description_str,
-                         color=0x30abc0)
-    core.set_thumbnail(url=bot.thumb)
+                         color=0xa3a3a3)
     core.add_field(name="How words are matched",
                    value=help_str.usage_str.format(min_length=bot.min_watchword_length),
                    inline=False)
@@ -943,9 +951,9 @@ async def help(ctx):
     extras.add_field(name="/botstop  (Admin only)", value=help_str.botstop_str, inline=False)
     extras.set_footer(text=help_str.admin_footer_str)
 
-    # 16 commands over 2 embeds: 11 and 6 fields (cap 25 each), well under the
-    # 6000-character cap per embed and across the message.
-    await ctx.send(embeds=[core, extras])
+    # 16 commands over 3 embeds (banner + 11 fields + 6 fields), each well inside
+    # the 25-field and 6000-character caps, and under 6000 across the message.
+    await ctx.send(embeds=[banner, core, extras])
 
 
 @bot.hybrid_command()
