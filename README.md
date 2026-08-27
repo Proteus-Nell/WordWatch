@@ -45,28 +45,33 @@ To run this bot on a Discord server:
    python main.py
    ```
 
-Slash commands are synced globally on startup. It may take up to 1 hour for them to appear in a new server.
+Slash commands are synced globally only when the command set changes (name, description, or options). Set `WORDWATCH_FORCE_SYNC=1` to force a sync. It may take up to 1 hour for changes to appear in a new server.
+
+All tunable settings live in `.env.example` — copy it to `.env` and uncomment anything you want to change.
 
 # Commands
 
 All commands are invoked via Discord's **Slash Commands** — type `/` in any text channel to see available options.
 
-Note: Phrases must be wrapped in quotes but single words don't. Also, commands will not work outside servers the bot is running in.
+Note: Type words and phrases exactly as you want them matched — do **not** wrap them in quotes. A quote character typed into a slash-command option is stored as part of the word and will never match a message. Matching ignores case and matches anywhere inside a message (`class` also triggers on `classroom`), and watched words must be at least 3 characters long. Commands will not work outside servers the bot is running in.
 
-1. `/help` - Displays documentation in a DM on how to use the bot.
+1. `/help` - Posts the full command documentation in the current channel.
 
-2. `/watched` - Gives user list of all watched words/phrases on the server. Also shows current `cd` setting.
+2. `/watched [page]` - Gives user list of all watched words/phrases on the server. Also shows current `cd` setting. Long lists are split into pages; the footer shows `Page X of Y` and the total count.
 
-3. `/watchword "word" [channels (optional)]` - Start watching a word and be alerted according to your `cd` setting. Channels can be filtered, skipping the `addfilter` step. Simply list channels after the word/phrase separated by spaces.
+         /watched
+         /watched page:2
 
-         /watchword "lorem ipsum" #general
+3. `/watchword <word> [channels (optional)]` - Start watching a word or phrase and be alerted according to your `cd` setting. Channels can be filtered, skipping the `addfilter` step. Simply list channels after the word/phrase separated by spaces. Must be at least 3 characters long.
+
+         /watchword lorem ipsum #general
          /watchword lorem #general #off-topic
-         /watchword "lorem ipsum"
+         /watchword lorem ipsum
          /watchword lorem
 
-4. `/deleteword "word"` - Deletes the specified word/phrase from your watch list.
+4. `/deleteword <word>` - Deletes the specified word/phrase from your watch list.
 
-         /deleteword "lorem ipsum"
+         /deleteword lorem ipsum
          /deleteword lorem
 
 5. `/watchclear` - Clears all watched words/phrases that you are watching.
@@ -76,22 +81,22 @@ Note: Phrases must be wrapped in quotes but single words don't. Also, commands w
          /cd
          /cd 3
 
-7. `/worddetail "word"` - Tells you the filtered channels enabled for the word/phrase and time the word/phrase was last seen.
+7. `/worddetail <word>` - Tells you the filtered channels enabled for the word/phrase and time the word/phrase was last seen.
 
-         /worddetail "lorem ipsum"
+         /worddetail lorem ipsum
          /worddetail lorem
 
-8. `/addfilter "word" [channels]` - Start watching for word/phrase in specified channels. Will not replace previously watching channels.
+8. `/addfilter <word> [channels]` - Start watching for word/phrase in specified channels. Will not replace previously watching channels.
 
          /addfilter lorem #general #games
 
-9. `/deletefilter "word" [channels]` - Stop watching for word/phrase in specified channels.
+9. `/deletefilter <word> [channels]` - Stop watching for word/phrase in specified channels.
 
-         /deletefilter "lorem ipsum" #off-topic #general
+         /deletefilter lorem ipsum #off-topic #general
 
-10. `/clearfilter "word"` - Remove all filters from word/phrase; watch entire server instead.
+10. `/clearfilter <word>` - Remove all filters from word/phrase; watch entire server instead.
 
-         /clearfilter "lorem ipsum"
+         /clearfilter lorem ipsum
          /clearfilter lorem
 
 11. `/swearboard` - Outputs a live-updating table of the top swearers in the server.
