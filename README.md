@@ -113,4 +113,4 @@ Note: Type words and phrases exactly as you want them matched — do **not** wra
 
 ## AI Usage Disclaimer
 
-This is a fork of WordWatch which was modified using AntiGravity/Gemini for my own personal usecases :P
+This is a fork of WordWatch which was modified using Gemini & Claude for my own personal use cases :P
